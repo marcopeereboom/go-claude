@@ -13,277 +13,290 @@ import (
 	"time"
 )
 
-// -------------------- constants --------------------
 const (
-	ClaudeMessagesURL = "https://api.anthropic.com/v1/messages"
-	ClaudeModelsURL   = "https://api.anthropic.com/v1/models"
-	AnthropicVersion  = "2023-06-01"
-	DefaultModel      = "claude-sonnet-4-5-20250929"
+	claudeAPIURL        = "https://api.anthropic.com/v1/messages"
+	modelsAPIURL        = "https://api.anthropic.com/v1/models"
+	defaultModel        = "claude-sonnet-4-5-20250929"
+	conversationDirName = ".claude"
+	conversationFile    = "claude_conversation.json"
+	modelFile           = "claude_model.json"
 )
 
-// -------------------- types --------------------
-type ClaudeMessageRequest struct {
-	Model     string          `json:"model"`
-	Messages  []ClaudeMessage `json:"messages"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
-}
-
-type ClaudeMessage struct {
+type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type ModelFile struct {
-	Model string `json:"model"`
+type ConversationLogEntry struct {
+	Request   json.RawMessage `json:"request"`
+	Response  json.RawMessage `json:"response"`
+	Timestamp string          `json:"timestamp"`
 }
 
-// -------------------- main --------------------
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	flagJSON := flag.Bool("json", false, "output raw JSON")
+	flagList := flag.Bool("list-models", false, "list supported Claude models")
+	flagMaxTokens := flag.Int("max-tokens", 1000, "max tokens for prompt")
+	flagModel := flag.String("model", defaultModel, "model id for single prompt")
+	flagOut := flag.String("o", "", "write output to file (default stdout)")
+	flagResume := flag.String("r", "", "directory to resume/save conversation context (defaults to cwd)")
+	flagTimeout := flag.Int("timeout", 30, "timeout in seconds")
+	flag.Parse()
+
+	if err := runCLI(*flagJSON, *flagList, *flagMaxTokens, *flagModel, *flagOut, *flagResume, *flagTimeout); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	// Flags
-	jsonFlag := flag.Bool("json", false, "output raw JSON")
-	listModels := flag.Bool("list-models", false, "list supported Claude models")
-	maxTokens := flag.Int("max-tokens", 1000, "max tokens for prompt")
-	model := flag.String("model", DefaultModel, "model id for single prompt")
-	outputFile := flag.String("o", "", "write output to file (default stdout)")
-	resumeDir := flag.String("r", "", "directory to resume/save conversation context (defaults to cwd)")
-	resumeDir2 := flag.String("resume", "", "same as -r")
-	timeoutSec := flag.Int("timeout", 15, "timeout in seconds")
-	flag.Parse()
-
-	// Resolve resume directory
-	dir := *resumeDir
-	if dir == "" {
-		dir = *resumeDir2
-	}
-	if dir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("getting cwd: %w", err)
-		}
-		dir = cwd
-	}
-
-	claudeDir := filepath.Join(dir, ".claude")
-	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
-		return fmt.Errorf("creating .claude dir: %w", err)
-	}
-
-	conversationFile := filepath.Join(claudeDir, "claude_conversation.json")
-	modelFile := filepath.Join(claudeDir, "claude_model.json")
-
+func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resumeDir string, timeout int) error {
 	apiKey := os.Getenv("CLAUDE_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("CLAUDE_API_KEY not set")
 	}
 
-	client := &http.Client{
-		Timeout: time.Duration(*timeoutSec) * time.Second,
+	if listModelsFlag {
+		return listModels(apiKey, jsonFlag, timeout)
 	}
 
-	writer, f, err := getOutputWriter(*outputFile)
+	if resumeDir == "" {
+		resumeDir = "."
+	}
+	resumeDir = filepath.Clean(resumeDir)
+	convDir := filepath.Join(resumeDir, conversationDirName)
+	if err := os.MkdirAll(convDir, 0o755); err != nil {
+		return fmt.Errorf("creating conversation dir: %w", err)
+	}
+	convPath := filepath.Join(convDir, conversationFile)
+	modelPath := filepath.Join(convDir, modelFile)
+
+	// Read stdin
+	promptBytes, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading stdin: %w", err)
+	}
+	prompt := string(bytes.TrimSpace(promptBytes))
+	if prompt == "" {
+		return fmt.Errorf("no input provided")
+	}
+
+	// Load conversation
+	messages, err := loadConversationContext(convPath)
+	if err != nil {
+		return fmt.Errorf("loading conversation: %w", err)
+	}
+
+	// Append current user message
+	messages = append(messages, Message{Role: "user", Content: prompt})
+
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"messages":   messages,
+		"max_tokens": maxTokens,
+	}
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshaling request: %w", err)
+	}
+
+	respBytes, err := callClaude(apiKey, reqBytes, timeout)
 	if err != nil {
 		return err
 	}
-	if f != nil {
+
+	// Output
+	outF := os.Stdout
+	if outFile != "" {
+		f, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("opening output file: %w", err)
+		}
 		defer f.Close()
+		outF = f
 	}
 
-	if *listModels {
-		return fetchModels(client, apiKey, *jsonFlag, writer)
+	if jsonFlag {
+		if _, err := outF.Write(append(respBytes, '\n')); err != nil {
+			return fmt.Errorf("writing output: %w", err)
+		}
+	} else {
+		var respObj struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(respBytes, &respObj); err != nil {
+			if _, err2 := outF.Write(append(respBytes, '\n')); err2 != nil {
+				return fmt.Errorf("writing raw output: %w", err2)
+			}
+		} else {
+			for _, c := range respObj.Content {
+				if _, err := fmt.Fprintln(outF, c.Text); err != nil {
+					return fmt.Errorf("writing output text: %w", err)
+				}
+			}
+		}
 	}
 
-	prompt, err := readPrompt(os.Stdin)
-	if err != nil {
-		return fmt.Errorf("reading prompt: %w", err)
-	}
-
-	if err := saveModel(modelFile, *model); err != nil {
-		return fmt.Errorf("saving model: %w", err)
-	}
-
-	respBytes, err := callClaude(client, apiKey, *model, *maxTokens, prompt)
-	if err != nil {
-		return err
-	}
-
-	if err := writeOutput(writer, respBytes, *jsonFlag); err != nil {
-		return err
-	}
-
-	// Append raw Claude JSON response to conversation NDJSON file
-	if err := appendConversation(conversationFile, respBytes); err != nil {
+	if err := appendLogEntry(convPath, reqBytes, respBytes); err != nil {
 		return fmt.Errorf("saving conversation: %w", err)
+	}
+
+	if err := os.WriteFile(modelPath, []byte(model), 0o644); err != nil {
+		return fmt.Errorf("saving model: %w", err)
 	}
 
 	return nil
 }
 
-// -------------------- helpers --------------------
-func getOutputWriter(path string) (*os.File, *os.File, error) {
-	if path == "" {
-		return os.Stdout, nil, nil
-	}
-	f, err := os.Create(path)
+func listModels(apiKey string, jsonFlag bool, timeout int) error {
+	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
+	req, err := http.NewRequest("GET", modelsAPIURL, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening output file: %w", err)
-	}
-	return f, f, nil
-}
-
-func readPrompt(r io.Reader) (string, error) {
-	var buf bytes.Buffer
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		buf.WriteString(scanner.Text())
-		buf.WriteByte('\n')
-	}
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
-func writeOutput(w io.Writer, respBytes []byte, rawJSON bool) error {
-	if rawJSON {
-		_, err := fmt.Fprintf(w, "%s\n", respBytes)
-		return err
-	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(respBytes, &resp); err != nil {
-		return fmt.Errorf("parsing response JSON: %w", err)
-	}
-
-	// Extract assistant content
-	if contentArr, ok := resp["content"].([]interface{}); ok && len(contentArr) > 0 {
-		if first, ok := contentArr[0].(map[string]interface{}); ok {
-			if text, ok := first["text"].(string); ok {
-				_, err := fmt.Fprintf(w, "%s\n", text)
-				return err
-			}
-		}
-	}
-
-	// fallback: raw JSON
-	_, err := fmt.Fprintf(w, "%s\n", respBytes)
-	return err
-}
-
-func saveModel(path, model string) error {
-	m := ModelFile{Model: model}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(&m)
-}
-
-// -------------------- conversation --------------------
-func appendConversation(path string, resp []byte) error {
-	var raw interface{}
-	if err := json.Unmarshal(resp, &raw); err != nil {
-		// fallback if parsing fails
-		return appendRaw(path, resp)
-	}
-
-	pretty, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return appendRaw(path, resp)
-	}
-
-	return appendRaw(path, pretty)
-}
-
-func appendRaw(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// NDJSON: append a newline
-	_, err = f.Write(append(data, '\n'))
-	return err
-}
-
-// -------------------- API calls --------------------
-func doRequest(client *http.Client, method, url, apiKey string, body []byte) ([]byte, error) {
-	req, err := http.NewRequest(method, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", AnthropicVersion)
-	if method == http.MethodPost || method == http.MethodPut {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("performing request: %w", err)
+		return fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading response: %w", err)
+	}
+
 	switch resp.StatusCode {
 	case 200:
-		// ok
+		if jsonFlag {
+			fmt.Println(string(body))
+		} else {
+			var parsed struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				fmt.Println(string(body))
+			} else {
+				for _, m := range parsed.Data {
+					fmt.Println(m.ID)
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("error %d fetching models: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func loadConversationContext(path string) ([]Message, error) {
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("opening conversation file: %w", err)
+	}
+	defer file.Close()
+
+	var messages []Message
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var entry ConversationLogEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		// Rehydrate user messages
+		var reqObj struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.Unmarshal(entry.Request, &reqObj); err == nil {
+			messages = append(messages, reqObj.Messages...)
+		}
+
+		// Rehydrate assistant messages
+		var respObj struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(entry.Response, &respObj); err == nil {
+			var combined string
+			for _, c := range respObj.Content {
+				combined += c.Text
+			}
+			if combined != "" {
+				messages = append(messages, Message{Role: "assistant", Content: combined})
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading conversation file: %w", err)
+	}
+	return messages, nil
+}
+
+func appendLogEntry(path string, req, resp []byte) error {
+	entry := ConversationLogEntry{
+		Request:   json.RawMessage(req),
+		Response:  json.RawMessage(resp),
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening log file: %w", err)
+	}
+	defer f.Close()
+
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshaling log entry: %w", err)
+	}
+
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("writing log entry: %w", err)
+	}
+	return nil
+}
+
+func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
+	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
+	request, err := http.NewRequest("POST", claudeAPIURL, bytes.NewReader(req))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("x-api-key", apiKey)
+	request.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		return body, nil
 	case 401:
 		return nil, fmt.Errorf("unauthorized: invalid API key")
-	case 402:
-		return nil, fmt.Errorf("payment required: out of tokens or quota exceeded")
 	default:
-		return nil, fmt.Errorf("HTTP error %d", resp.StatusCode)
+		return nil, fmt.Errorf("error %d: %s", resp.StatusCode, string(body))
 	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	return data, nil
-}
-
-func callClaude(client *http.Client, apiKey, model string, maxTokens int, prompt string) ([]byte, error) {
-	reqBody := ClaudeMessageRequest{
-		Model: model,
-		Messages: []ClaudeMessage{
-			{Role: "user", Content: prompt},
-		},
-		MaxTokens: maxTokens,
-	}
-	reqBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, err
-	}
-	return doRequest(client, http.MethodPost, ClaudeMessagesURL, apiKey, reqBytes)
-}
-
-func fetchModels(client *http.Client, apiKey string, raw bool, writer io.Writer) error {
-	respBytes, err := doRequest(client, http.MethodGet, ClaudeModelsURL, apiKey, nil)
-	if err != nil {
-		return err
-	}
-
-	if raw {
-		_, err = fmt.Fprintf(writer, "%s\n", respBytes)
-		return err
-	}
-
-	var parsed interface{}
-	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return err
-	}
-	out, _ := json.MarshalIndent(parsed, "", "  ")
-	_, err = fmt.Fprintf(writer, "%s\n", out)
-	return err
 }
