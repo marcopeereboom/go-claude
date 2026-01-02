@@ -185,7 +185,7 @@ func listModels(apiKey string, jsonFlag bool, timeout int) error {
 	}
 
 	switch resp.StatusCode {
-	case 200:
+	case http.StatusOK:
 		if jsonFlag {
 			fmt.Println(string(body))
 		} else {
@@ -303,9 +303,9 @@ func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
 	}
 
 	switch resp.StatusCode {
-	case 200:
+	case http.StatusOK:
 		return body, nil
-	case 401:
+	case http.StatusUnauthorized:
 		return nil, fmt.Errorf("unauthorized: invalid API key")
 	default:
 		return nil, fmt.Errorf("error %d: %s", resp.StatusCode, string(body))
