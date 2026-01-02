@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +34,7 @@ type ConversationLogEntry struct {
 	Timestamp string          `json:"timestamp"`
 }
 
+// stdinIsPiped returns true if stdin is piped
 func stdinIsPiped() bool {
 	info, err := os.Stdin.Stat()
 	if err != nil {
@@ -165,45 +167,29 @@ func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resume
 	return nil
 }
 
+// listModels lists all available Claude models
 func listModels(apiKey string, jsonFlag bool, timeout int) error {
-	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
-	req, err := http.NewRequest("GET", modelsAPIURL, nil)
+	body, err := doRequest(apiKey, http.MethodGet, modelsAPIURL, nil, timeout)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
+		return err
 	}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if jsonFlag {
-			fmt.Println(string(body))
-		} else {
-			var parsed struct {
-				Data []struct {
-					ID string `json:"id"`
-				} `json:"data"`
-			}
-			if err := json.Unmarshal(body, &parsed); err != nil {
-				fmt.Println(string(body))
-			} else {
-				for _, m := range parsed.Data {
-					fmt.Println(m.ID)
-				}
-			}
-		}
-	default:
-		return fmt.Errorf("error %d fetching models: %s", resp.StatusCode, string(body))
+	if jsonFlag {
+		fmt.Println(string(body))
+		return nil
+	}
+
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		fmt.Println(string(body))
+		return nil
+	}
+	for _, m := range parsed.Data {
+		fmt.Println(m.ID)
 	}
 	return nil
 }
@@ -281,33 +267,57 @@ func appendLogEntry(path string, req, resp []byte) error {
 	return nil
 }
 
-func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
+// Unified HTTP request function for both prompts and model listing
+func doRequest(apiKey, method, url string, body []byte, timeoutSec int) ([]byte, error) {
 	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
-	request, err := http.NewRequest("POST", claudeAPIURL, bytes.NewReader(req))
+
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("x-api-key", apiKey)
-	request.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
-	resp, err := client.Do(request)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
+	// Unified error handling
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return body, nil
+		return respBody, nil
 	case http.StatusUnauthorized:
-		return nil, fmt.Errorf("unauthorized: invalid API key")
+		return nil, errors.New("unauthorized: invalid API key")
+	case http.StatusNotFound:
+		return nil, errors.New("resource not found (404)")
+	case http.StatusUnprocessableEntity:
+		return nil, fmt.Errorf("request could not be processed: %s", string(respBody))
+	case http.StatusTooManyRequests:
+		return nil, errors.New("rate limit exceeded (429)")
+	case http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return nil, fmt.Errorf("server error %d: %s", resp.StatusCode, string(respBody))
 	default:
-		return nil, fmt.Errorf("error %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
 	}
+}
+
+// callClaude now simply calls the unified doRequest
+func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
+	return doRequest(apiKey, http.MethodPost, claudeAPIURL, req, timeoutSec)
 }
