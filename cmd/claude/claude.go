@@ -33,6 +33,14 @@ type ConversationLogEntry struct {
 	Timestamp string          `json:"timestamp"`
 }
 
+func stdinIsPiped() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice == 0
+}
+
 func main() {
 	flagJSON := flag.Bool("json", false, "output raw JSON")
 	flagList := flag.Bool("list-models", false, "list supported Claude models")
@@ -67,15 +75,22 @@ func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resume
 	if err := os.MkdirAll(convDir, 0o755); err != nil {
 		return fmt.Errorf("creating conversation dir: %w", err)
 	}
+
 	convPath := filepath.Join(convDir, conversationFile)
 	modelPath := filepath.Join(convDir, modelFile)
 
-	// Read stdin
-	promptBytes, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return fmt.Errorf("reading stdin: %w", err)
+	// Read stdin prompt (patched to avoid hang)
+	var prompt string
+	if stdinIsPiped() {
+		promptBytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		prompt = string(bytes.TrimSpace(promptBytes))
+	} else {
+		prompt = ""
 	}
-	prompt := string(bytes.TrimSpace(promptBytes))
+
 	if prompt == "" {
 		return fmt.Errorf("no input provided")
 	}
@@ -158,7 +173,6 @@ func listModels(apiKey string, jsonFlag bool, timeout int) error {
 	}
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("http request: %w", err)
@@ -211,13 +225,11 @@ func loadConversationContext(path string) ([]Message, error) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-
 		var entry ConversationLogEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			continue
 		}
 
-		// Rehydrate user messages
 		var reqObj struct {
 			Messages []Message `json:"messages"`
 		}
@@ -225,7 +237,6 @@ func loadConversationContext(path string) ([]Message, error) {
 			messages = append(messages, reqObj.Messages...)
 		}
 
-		// Rehydrate assistant messages
 		var respObj struct {
 			Content []struct {
 				Text string `json:"text"`
@@ -241,6 +252,7 @@ func loadConversationContext(path string) ([]Message, error) {
 			}
 		}
 	}
+
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("reading conversation file: %w", err)
 	}
@@ -263,7 +275,6 @@ func appendLogEntry(path string, req, resp []byte) error {
 	if err != nil {
 		return fmt.Errorf("marshaling log entry: %w", err)
 	}
-
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("writing log entry: %w", err)
 	}
