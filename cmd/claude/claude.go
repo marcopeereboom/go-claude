@@ -51,15 +51,16 @@ func main() {
 	flagOut := flag.String("o", "", "write output to file (default stdout)")
 	flagResume := flag.String("r", "", "directory to resume/save conversation context (defaults to cwd)")
 	flagTimeout := flag.Int("timeout", 30, "timeout in seconds")
+	flagSystem := flag.String("system", "", "override default system prompt")
 	flag.Parse()
 
-	if err := runCLI(*flagJSON, *flagList, *flagMaxTokens, *flagModel, *flagOut, *flagResume, *flagTimeout); err != nil {
+	if err := runCLI(*flagJSON, *flagList, *flagMaxTokens, *flagModel, *flagOut, *flagResume, *flagTimeout, *flagSystem); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 }
 
-func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resumeDir string, timeout int) error {
+func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resumeDir string, timeout int, systemFlag string) error {
 	apiKey := os.Getenv("CLAUDE_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("CLAUDE_API_KEY not set")
@@ -81,7 +82,7 @@ func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resume
 	convPath := filepath.Join(convDir, conversationFile)
 	modelPath := filepath.Join(convDir, modelFile)
 
-	// Read stdin prompt (patched to avoid hang)
+	// Read stdin prompt
 	var prompt string
 	if stdinIsPiped() {
 		promptBytes, err := io.ReadAll(os.Stdin)
@@ -106,9 +107,16 @@ func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resume
 	// Append current user message
 	messages = append(messages, Message{Role: "user", Content: prompt})
 
+	// Determine system prompt
+	systemPrompt := "Always label code blocks with filenames: ```language filename"
+	if systemFlag != "" {
+		systemPrompt = systemFlag
+	}
+
 	reqBody := map[string]interface{}{
 		"model":      model,
 		"messages":   messages,
+		"system":     systemPrompt,
 		"max_tokens": maxTokens,
 	}
 
@@ -317,7 +325,7 @@ func doRequest(apiKey, method, url string, body []byte, timeoutSec int) ([]byte,
 	}
 }
 
-// callClaude now simply calls the unified doRequest
+// callClaude simply calls the unified doRequest
 func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
 	return doRequest(apiKey, http.MethodPost, claudeAPIURL, req, timeoutSec)
 }
