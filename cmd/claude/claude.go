@@ -1,315 +1,289 @@
-// claude.go
-// Simple Claude CLI: single-shot or list models with JSON/human output and resumable conversations.
-
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
+// -------------------- constants --------------------
 const (
-	apiBase          = "https://api.anthropic.com/v1"
-	apiVersion       = "2023-06-01"
-	defaultModel     = "claude-sonnet-4-5-20250929"
-	defaultMaxTokens = 1000
-	defaultTimeout   = 30 * time.Second
+	ClaudeMessagesURL = "https://api.anthropic.com/v1/messages"
+	ClaudeModelsURL   = "https://api.anthropic.com/v1/models"
+	AnthropicVersion  = "2023-06-01"
+	DefaultModel      = "claude-sonnet-4-5-20250929"
 )
 
-// API errors
-var (
-	ErrUnauthorized = errors.New("unauthorized: invalid or missing API key")
-	ErrRateLimited  = errors.New("rate limited: too many requests")
-)
-
-// ====================
-// API structures
-// ====================
-
-// Model represents a Claude model in /v1/models
-type Model struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
+// -------------------- types --------------------
+type ClaudeMessageRequest struct {
+	Model     string          `json:"model"`
+	Messages  []ClaudeMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens,omitempty"`
 }
 
-// ModelListResponse is the API response from /v1/models
-type ModelListResponse struct {
-	Data []Model `json:"data"`
+type ClaudeMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-// Message represents a message in a conversation
-type Message struct {
-	Role    string `json:"role"`    // "user" or "assistant"
-	Content string `json:"content"` // message text
+type ModelFile struct {
+	Model string `json:"model"`
 }
 
-// MessagesRequest is used to send a prompt to the API
-type MessagesRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	Messages  []Message `json:"messages"`
-}
-
-// Delta represents incremental content from a streaming response
-type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
-}
-
-// MessageChoice represents a single response choice from Claude
-type MessageChoice struct {
-	Index  int    `json:"index"`
-	Delta  Delta  `json:"delta"`
-	Finish string `json:"finish_reason"`
-}
-
-// MessagesResponse represents the response from /v1/messages
-type MessagesResponse struct {
-	ID      string          `json:"id"`
-	Choices []MessageChoice `json:"choices"`
-	Created int64           `json:"created"`
-	Model   string          `json:"model"`
-	Object  string          `json:"object"`
-}
-
-// UsageInfo contains token usage counts
-type UsageInfo struct {
-	CompletionTokens int `json:"completion_tokens"`
-	PromptTokens     int `json:"prompt_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-// ====================
-// Main
-// ====================
-
+// -------------------- main --------------------
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "fatal:", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// run parses flags, handles CLI logic, and writes output.
 func run() error {
-	jsonOut := flag.Bool("json", false, "output raw JSON")
-	outFile := flag.String("o", "", "write output to file (default stdout)")
+	// Flags
+	jsonFlag := flag.Bool("json", false, "output raw JSON")
 	listModels := flag.Bool("list-models", false, "list supported Claude models")
-	model := flag.String("model", defaultModel, "model id for single prompt")
-	maxTokens := flag.Int("max-tokens", defaultMaxTokens, "max tokens for prompt")
-	timeout := flag.Int("timeout", int(defaultTimeout.Seconds()), "timeout in seconds")
+	maxTokens := flag.Int("max-tokens", 1000, "max tokens for prompt")
+	model := flag.String("model", DefaultModel, "model id for single prompt")
+	outputFile := flag.String("o", "", "write output to file (default stdout)")
 	resumeDir := flag.String("r", "", "directory to resume/save conversation context (defaults to cwd)")
-	flag.StringVar(resumeDir, "resume", "", "same as -r")
+	resumeDir2 := flag.String("resume", "", "same as -r")
+	timeoutSec := flag.Int("timeout", 15, "timeout in seconds")
 	flag.Parse()
 
-	if *resumeDir == "" {
+	// Resolve resume directory
+	dir := *resumeDir
+	if dir == "" {
+		dir = *resumeDir2
+	}
+	if dir == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return fmt.Errorf("cannot get cwd: %w", err)
+			return fmt.Errorf("getting cwd: %w", err)
 		}
-		*resumeDir = cwd
+		dir = cwd
 	}
-	convFile := fmt.Sprintf("%s/.claude_conversation.json", *resumeDir)
+
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		return fmt.Errorf("creating .claude dir: %w", err)
+	}
+
+	conversationFile := filepath.Join(claudeDir, "claude_conversation.json")
+	modelFile := filepath.Join(claudeDir, "claude_model.json")
 
 	apiKey := os.Getenv("CLAUDE_API_KEY")
 	if apiKey == "" {
-		return errors.New("CLAUDE_API_KEY not set")
+		return fmt.Errorf("CLAUDE_API_KEY not set")
 	}
 
-	client := &http.Client{Timeout: time.Duration(*timeout) * time.Second}
-
-	var output []byte
-	var err error
-
-	// Load previous conversation if resuming
-	var conversation []Message
-	if !*listModels {
-		if _, err := os.Stat(convFile); err == nil {
-			data, err := os.ReadFile(convFile)
-			if err == nil {
-				_ = json.Unmarshal(data, &conversation)
-				fmt.Fprintf(os.Stderr, "Loaded conversation with %d messages from %s\n", len(conversation), convFile)
-			}
-		}
+	client := &http.Client{
+		Timeout: time.Duration(*timeoutSec) * time.Second,
 	}
 
-	switch {
-	case *listModels:
-		output, err = listModelsCmd(client, apiKey, *jsonOut)
-	default:
-		output, err = singlePromptCmd(client, apiKey, *model, *maxTokens, *jsonOut, conversation, flag.Args())
-		if err == nil {
-			// Append user + assistant messages and save
-			if len(flag.Args()) > 0 {
-				userMsg := Message{Role: "user", Content: fmt.Sprintf("%s", flag.Args())}
-				conversation = append(conversation, userMsg)
-				conversation = append(conversation, Message{Role: "assistant", Content: string(output)})
-				if err := saveConversation(convFile, conversation); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: cannot save conversation: %v\n", err)
-				}
-			}
-		}
-	}
-
-	// Handle errors: pretty or JSON
+	writer, f, err := getOutputWriter(*outputFile)
 	if err != nil {
-		if *jsonOut {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			fmt.Fprintln(os.Stdout, string(errJSON))
-			return nil
-		}
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return nil
+		return err
+	}
+	if f != nil {
+		defer f.Close()
 	}
 
-	return writeOutput(*outFile, output)
+	if *listModels {
+		return fetchModels(client, apiKey, *jsonFlag, writer)
+	}
+
+	prompt, err := readPrompt(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading prompt: %w", err)
+	}
+
+	if err := saveModel(modelFile, *model); err != nil {
+		return fmt.Errorf("saving model: %w", err)
+	}
+
+	respBytes, err := callClaude(client, apiKey, *model, *maxTokens, prompt)
+	if err != nil {
+		return err
+	}
+
+	if err := writeOutput(writer, respBytes, *jsonFlag); err != nil {
+		return err
+	}
+
+	// Append raw Claude JSON response to conversation NDJSON file
+	if err := appendConversation(conversationFile, respBytes); err != nil {
+		return fmt.Errorf("saving conversation: %w", err)
+	}
+
+	return nil
 }
 
-// ====================
-// API calls
-// ====================
-
-// doRequest performs an HTTP request to the Claude API, supporting GET or POST.
-func doRequest(client *http.Client, url, apiKey string, body any, method string) ([]byte, error) {
-	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal request: %w", err)
-		}
-		reader = bytes.NewReader(b)
+// -------------------- helpers --------------------
+func getOutputWriter(path string) (*os.File, *os.File, error) {
+	if path == "" {
+		return os.Stdout, nil, nil
 	}
-
-	if method == "" {
-		method = http.MethodPost
-	}
-
-	req, err := http.NewRequest(method, url, reader)
+	f, err := os.Create(path)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, nil, fmt.Errorf("opening output file: %w", err)
+	}
+	return f, f, nil
+}
+
+func readPrompt(r io.Reader) (string, error) {
+	var buf bytes.Buffer
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		buf.WriteString(scanner.Text())
+		buf.WriteByte('\n')
+	}
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func writeOutput(w io.Writer, respBytes []byte, rawJSON bool) error {
+	if rawJSON {
+		_, err := fmt.Fprintf(w, "%s\n", respBytes)
+		return err
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	var resp map[string]interface{}
+	if err := json.Unmarshal(respBytes, &resp); err != nil {
+		return fmt.Errorf("parsing response JSON: %w", err)
+	}
+
+	// Extract assistant content
+	if contentArr, ok := resp["content"].([]interface{}); ok && len(contentArr) > 0 {
+		if first, ok := contentArr[0].(map[string]interface{}); ok {
+			if text, ok := first["text"].(string); ok {
+				_, err := fmt.Fprintf(w, "%s\n", text)
+				return err
+			}
+		}
+	}
+
+	// fallback: raw JSON
+	_, err := fmt.Fprintf(w, "%s\n", respBytes)
+	return err
+}
+
+func saveModel(path, model string) error {
+	m := ModelFile{Model: model}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(&m)
+}
+
+// -------------------- conversation --------------------
+func appendConversation(path string, resp []byte) error {
+	var raw interface{}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		// fallback if parsing fails
+		return appendRaw(path, resp)
+	}
+
+	pretty, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return appendRaw(path, resp)
+	}
+
+	return appendRaw(path, pretty)
+}
+
+func appendRaw(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// NDJSON: append a newline
+	_, err = f.Write(append(data, '\n'))
+	return err
+}
+
+// -------------------- API calls --------------------
+func doRequest(client *http.Client, method, url, apiKey string, body []byte) ([]byte, error) {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
 	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", apiVersion)
+	req.Header.Set("anthropic-version", AnthropicVersion)
+	if method == http.MethodPost || method == http.MethodPut {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
+		return nil, fmt.Errorf("performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	switch resp.StatusCode {
+	case 200:
+		// ok
+	case 401:
+		return nil, fmt.Errorf("unauthorized: invalid API key")
+	case 402:
+		return nil, fmt.Errorf("payment required: out of tokens or quota exceeded")
+	default:
+		return nil, fmt.Errorf("HTTP error %d", resp.StatusCode)
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return data, nil
-	case http.StatusUnauthorized:
-		return nil, ErrUnauthorized
-	case http.StatusTooManyRequests:
-		return nil, ErrRateLimited
-	default:
-		return nil, fmt.Errorf("api error (%d): %s", resp.StatusCode, bytes.TrimSpace(data))
-	}
+	return data, nil
 }
 
-// ====================
-// Command functions
-// ====================
-
-// listModelsCmd fetches all Claude models and returns output in JSON or human-readable form.
-func listModelsCmd(client *http.Client, apiKey string, jsonOut bool) ([]byte, error) {
-	resp, err := doRequest(client, apiBase+"/models", apiKey, nil, http.MethodGet)
+func callClaude(client *http.Client, apiKey, model string, maxTokens int, prompt string) ([]byte, error) {
+	reqBody := ClaudeMessageRequest{
+		Model: model,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: maxTokens,
+	}
+	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
-
-	if jsonOut {
-		return resp, nil
-	}
-
-	var decoded ModelListResponse
-	if err := json.Unmarshal(resp, &decoded); err != nil {
-		return nil, fmt.Errorf("parse model list: %w", err)
-	}
-
-	var out bytes.Buffer
-	for _, m := range decoded.Data {
-		fmt.Fprintf(&out, "- %-35s %s\n", m.ID, m.DisplayName)
-	}
-
-	return out.Bytes(), nil
+	return doRequest(client, http.MethodPost, ClaudeMessagesURL, apiKey, reqBytes)
 }
 
-// singlePromptCmd sends a single prompt to Claude and returns the raw assistant output.
-func singlePromptCmd(client *http.Client, apiKey, model string, maxTokens int, jsonOut bool, conversation []Message, args []string) ([]byte, error) {
-	if len(args) == 0 {
-		return nil, errors.New("no prompt provided")
-	}
-
-	userMsg := Message{
-		Role:    "user",
-		Content: fmt.Sprintf("%s", args),
-	}
-	conversation = append(conversation, userMsg)
-
-	reqBody := MessagesRequest{
-		Model:     model,
-		MaxTokens: maxTokens,
-		Messages:  conversation,
-	}
-
-	resp, err := doRequest(client, apiBase+"/messages", apiKey, reqBody, http.MethodPost)
+func fetchModels(client *http.Client, apiKey string, raw bool, writer io.Writer) error {
+	respBytes, err := doRequest(client, http.MethodGet, ClaudeModelsURL, apiKey, nil)
 	if err != nil {
-		return nil, fmt.Errorf("send prompt: %w", err)
+		return err
 	}
 
-	if jsonOut {
-		return resp, nil
+	if raw {
+		_, err = fmt.Fprintf(writer, "%s\n", respBytes)
+		return err
 	}
 
-	var decoded MessagesResponse
-	if err := json.Unmarshal(resp, &decoded); err != nil {
-		return nil, fmt.Errorf("parse assistant response: %w", err)
+	var parsed interface{}
+	if err := json.Unmarshal(respBytes, &parsed); err != nil {
+		return err
 	}
-
-	var out bytes.Buffer
-	for _, choice := range decoded.Choices {
-		out.WriteString(choice.Delta.Content)
-	}
-
-	return out.Bytes(), nil
-}
-
-// ====================
-// Output helpers
-// ====================
-
-// writeOutput writes the output to a file or stdout if filename is empty.
-func writeOutput(filename string, data []byte) error {
-	if filename == "" {
-		fmt.Print(string(data))
-		return nil
-	}
-
-	return os.WriteFile(filename, data, 0o644)
-}
-
-// saveConversation writes the conversation to the specified file.
-func saveConversation(filename string, conv []Message) error {
-	data, err := json.MarshalIndent(conv, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal conversation: %w", err)
-	}
-	return os.WriteFile(filename, data, 0o644)
+	out, _ := json.MarshalIndent(parsed, "", "  ")
+	_, err = fmt.Fprintf(writer, "%s\n", out)
+	return err
 }
