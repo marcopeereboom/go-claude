@@ -83,8 +83,10 @@ type options struct {
 	model        string
 	outputFile   string
 	resumeDir    string
+	showStats    bool
 	timeout      int
 	systemPrompt string
+	verbose      bool
 }
 
 func main() {
@@ -101,14 +103,17 @@ func run() error {
 		return listModels()
 	}
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		return fmt.Errorf("ANTHROPIC_API_KEY not set")
-	}
-
 	claudeDir, err := getClaudeDir(opts.resumeDir)
 	if err != nil {
 		return err
+	}
+	if opts.showStats {
+		return showStats(claudeDir)
+	}
+
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return fmt.Errorf("ANTHROPIC_API_KEY not set")
 	}
 
 	// TODO audit all errors, these duplicate text, e.g. mkdir returns
@@ -136,11 +141,19 @@ func run() error {
 		return err
 	}
 
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
+		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
+	}
+
 	contextPath := filepath.Join(claudeDir, "context.json")
 	// TODO don't use ctx ever, that is essentially a reserved word in go code.
 	ctx, err := loadContext(contextPath)
 	if err != nil {
 		return err
+	}
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n", len(ctx.Messages))
 	}
 
 	ctx.Messages = append(ctx.Messages, Message{
@@ -172,6 +185,15 @@ func run() error {
 			"API error [%s]: %s",
 			apiResp.Error.Type,
 			apiResp.Error.Message,
+		)
+	}
+
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Tokens: %d in, %d out (total: %d in, %d out)\n",
+			apiResp.Usage.InputTokens,
+			apiResp.Usage.OutputTokens,
+			cfg.TotalInput,
+			cfg.TotalOutput,
 		)
 	}
 
@@ -233,11 +255,15 @@ func parseFlags() *options {
 		"directory to resume/save conversation context")
 	flag.StringVar(&resumeDir2, "resume", "",
 		"same as -r")
+	flag.BoolVar(&opts.showStats, "stats", false,
+		"show conversation statistics")
 
 	flag.IntVar(&opts.timeout, "timeout", 30,
 		"timeout in seconds")
 	flag.StringVar(&opts.systemPrompt, "system", "",
 		"custom system prompt")
+	flag.BoolVar(&opts.verbose, "verbose", false,
+		"verbose output (show context size, tokens, etc)")
 
 	flag.Parse()
 
@@ -255,6 +281,24 @@ func listModels() error {
 	fmt.Println("  claude-sonnet-4-5-20250929")
 	fmt.Println("  claude-sonnet-4-20250514")
 	fmt.Println("  claude-haiku-4-5-20251001")
+	return nil
+}
+
+func showStats(claudeDir string) error {
+	cfg, _ := loadConfig(filepath.Join(claudeDir, "config.json"))
+	hist, _ := loadHistory(filepath.Join(claudeDir, "history.json"))
+	ctx, _ := loadContext(filepath.Join(claudeDir, "context.json"))
+
+	fmt.Printf("Project: %s\n", claudeDir)
+	fmt.Printf("Model: %s\n", cfg.Model)
+	fmt.Printf("Total tokens: %d in, %d out\n", cfg.TotalInput, cfg.TotalOutput)
+	fmt.Printf("Approximate cost: $%.4f\n",
+		float64(cfg.TotalInput)*3.0/1000000+float64(cfg.TotalOutput)*15.0/1000000)
+	fmt.Printf("History: %d messages\n", len(hist.Messages))
+	fmt.Printf("Context: %d messages\n", len(ctx.Messages))
+	fmt.Printf("Created: %s\n", cfg.CreatedAt)
+	fmt.Printf("Updated: %s\n", cfg.UpdatedAt)
+
 	return nil
 }
 
