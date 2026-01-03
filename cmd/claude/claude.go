@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 const (
@@ -77,6 +79,7 @@ type Context struct {
 }
 
 type options struct {
+	debug        bool
 	jsonOutput   bool
 	listModels   bool
 	maxTokens    int
@@ -165,14 +168,8 @@ func run() error {
 		Timeout: time.Duration(opts.timeout) * time.Second,
 	}
 
-	apiResp, respBody, err := callAPI(
-		client,
-		apiKey,
-		selectedModel,
-		opts.maxTokens,
-		sysPrompt,
-		ctx.Messages,
-	)
+	apiResp, respBody, err := callAPI(client, apiKey, selectedModel, opts.maxTokens,
+		sysPrompt, ctx.Messages, opts)
 	if err != nil {
 		return err
 	}
@@ -181,20 +178,15 @@ func run() error {
 		if opts.jsonOutput {
 			fmt.Println(string(respBody))
 		}
-		return fmt.Errorf(
-			"API error [%s]: %s",
-			apiResp.Error.Type,
+		return fmt.Errorf("API error [%s]: %s", apiResp.Error.Type,
 			apiResp.Error.Message,
 		)
 	}
 
 	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "Tokens: %d in, %d out (total: %d in, %d out)\n",
-			apiResp.Usage.InputTokens,
-			apiResp.Usage.OutputTokens,
-			cfg.TotalInput,
-			cfg.TotalOutput,
-		)
+			apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
+			cfg.TotalInput, cfg.TotalOutput)
 	}
 
 	assistantText := extractResponse(apiResp)
@@ -228,40 +220,29 @@ func run() error {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
-	return writeOutput(
-		opts.outputFile,
-		opts.jsonOutput,
-		assistantText,
-		respBody,
-	)
+	return writeOutput(opts.outputFile, opts.jsonOutput, assistantText, respBody)
 }
 
 func parseFlags() *options {
 	opts := &options{}
 
-	flag.BoolVar(&opts.jsonOutput, "json", false,
-		"output raw JSON")
+	flag.BoolVar(&opts.debug, "debug", false, "debug output")
+	flag.BoolVar(&opts.jsonOutput, "json", false, "output raw JSON")
 	flag.BoolVar(&opts.listModels, "list-models", false,
 		"list supported Claude models")
 	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
 		"max tokens for prompt")
-	flag.StringVar(&opts.model, "model", "",
-		"model id for single prompt")
-	flag.StringVar(&opts.outputFile, "o", "",
-		"write output to file (default stdout)")
+	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
+	flag.StringVar(&opts.outputFile, "o", "", "write output to file (default stdout)")
 
 	var resumeDir2 string
 	flag.StringVar(&opts.resumeDir, "r", "",
 		"directory to resume/save conversation context")
-	flag.StringVar(&resumeDir2, "resume", "",
-		"same as -r")
-	flag.BoolVar(&opts.showStats, "stats", false,
-		"show conversation statistics")
+	flag.StringVar(&resumeDir2, "resume", "", "same as -r")
+	flag.BoolVar(&opts.showStats, "stats", false, "show conversation statistics")
 
-	flag.IntVar(&opts.timeout, "timeout", 30,
-		"timeout in seconds")
-	flag.StringVar(&opts.systemPrompt, "system", "",
-		"custom system prompt")
+	flag.IntVar(&opts.timeout, "timeout", 30, "timeout in seconds")
+	flag.StringVar(&opts.systemPrompt, "system", "", "custom system prompt")
 	flag.BoolVar(&opts.verbose, "verbose", false,
 		"verbose output (show context size, tokens, etc)")
 
@@ -353,14 +334,7 @@ func readInput() (string, error) {
 	return msg, nil
 }
 
-func callAPI(
-	client *http.Client,
-	apiKey string,
-	model string,
-	maxTokens int,
-	system string,
-	messages []Message,
-) (*APIResponse, []byte, error) {
+func callAPI(client *http.Client, apiKey string, model string, maxTokens int, system string, messages []Message, opts *options) (*APIResponse, []byte, error) {
 	apiReq := APIRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
@@ -370,22 +344,16 @@ func callAPI(
 
 	reqBody, err := json.Marshal(apiReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"marshaling request: %w",
-			err,
-		)
+		return nil, nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest(
-		"POST",
-		apiURL,
-		bytes.NewBuffer(reqBody),
-	)
+	if opts.debug {
+		fmt.Println("=== request ===")
+		spew.Dump(reqBody)
+	}
+	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(reqBody))
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"creating request: %w",
-			err,
-		)
+		return nil, nil, fmt.Errorf("creating request: %w", err)
 	}
 
 	httpReq.Header.Set("x-api-key", apiKey)
@@ -403,10 +371,7 @@ func callAPI(
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"reading response: %w",
-			err,
-		)
+		return nil, nil, fmt.Errorf("reading response: %w", err)
 	}
 
 	if err := checkHTTPStatus(resp.StatusCode, respBody); err != nil {
@@ -415,11 +380,12 @@ func callAPI(
 
 	var apiResp APIResponse
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, nil, fmt.Errorf(
-			"parsing response: %w\nBody: %s",
-			err,
-			string(respBody),
-		)
+		return nil, nil, fmt.Errorf("parsing response: %w\nBody: %s", err,
+			string(respBody))
+	}
+	if opts.debug {
+		fmt.Println("=== response ===")
+		spew.Dump(respBody)
 	}
 
 	return &apiResp, respBody, nil
