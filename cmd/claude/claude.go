@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -18,7 +19,7 @@ const (
 	defaultModel        = "claude-sonnet-4-5-20250929"
 	apiURL              = "https://api.anthropic.com/v1/messages"
 	apiVersion          = "2023-06-01"
-	maxContextTokens    = 100000 // Safe limit, ~75k tokens
+	maxContextTokens    = 100000
 	defaultSystemPrompt = `You are a helpful coding assistant. Always wrap:
 - Filenames in backticks with language: ` + "```go filename.go```" + `
 - Code blocks in triple backticks with language specified
@@ -26,30 +27,49 @@ const (
 This helps with automated extraction and saving.`
 )
 
+type ContentBlock struct {
+	Type      string                 `json:"type"`
+	Text      string                 `json:"text,omitempty"`
+	ID        string                 `json:"id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Input     map[string]interface{} `json:"input,omitempty"`
+	ToolUseID string                 `json:"tool_use_id,omitempty"`
+	Content   string                 `json:"content,omitempty"`
+}
+
+type MessageContent struct {
+	Role    string         `json:"role"`
+	Content []ContentBlock `json:"content"`
+}
+
+type Tool struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	InputSchema interface{} `json:"input_schema"`
+}
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
 type APIRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system,omitempty"`
-	Messages  []Message `json:"messages"`
+	Model     string      `json:"model"`
+	MaxTokens int         `json:"max_tokens"`
+	System    string      `json:"system,omitempty"`
+	Messages  interface{} `json:"messages"`
+	Tools     []Tool      `json:"tools,omitempty"`
 }
 
 type APIResponse struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Role    string `json:"role"`
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	Model      string    `json:"model"`
-	StopReason string    `json:"stop_reason"`
-	Usage      Usage     `json:"usage"`
-	Error      *APIError `json:"error,omitempty"`
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Role       string         `json:"role"`
+	Content    []ContentBlock `json:"content"`
+	Model      string         `json:"model"`
+	StopReason string         `json:"stop_reason"`
+	Usage      Usage          `json:"usage"`
+	Error      *APIError      `json:"error,omitempty"`
 }
 
 type APIError struct {
@@ -81,10 +101,12 @@ type Context struct {
 
 type options struct {
 	debug        bool
+	execute      bool
 	jsonOutput   bool
 	listModels   bool
 	maxTokens    int
 	model        string
+	noTools      bool
 	outputFile   string
 	reset        bool
 	resumeDir    string
@@ -160,15 +182,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n",
+			len(ctx.Messages))
+	}
 	if opts.truncate > 0 && len(ctx.Messages) > opts.truncate {
 		if opts.verbose {
 			fmt.Fprintf(os.Stderr, "Truncating context: %d → %d messages\n",
 				len(ctx.Messages), opts.truncate)
 		}
 		ctx.Messages = ctx.Messages[len(ctx.Messages)-opts.truncate:]
-	}
-	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n", len(ctx.Messages))
 	}
 
 	ctx.Messages = append(ctx.Messages, Message{
@@ -191,71 +214,116 @@ func run() error {
 		Timeout: time.Duration(opts.timeout) * time.Second,
 	}
 
-	apiResp, respBody, err := callAPI(client, apiKey, selectedModel, opts.maxTokens,
-		sysPrompt, ctx.Messages, opts)
-	if err != nil {
-		return err
-	}
+	// Tool loop
+	workingDir, _ := os.Getwd()
+	messages := convertToMessageContent(ctx.Messages)
 
-	if apiResp.Error != nil {
-		if opts.jsonOutput {
-			fmt.Println(string(respBody))
+	for i := 0; i < 10; i++ { // Max 10 tool iterations
+		apiResp, respBody, err := callAPI(client, apiKey, selectedModel,
+			opts.maxTokens, sysPrompt, messages, opts)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("API error [%s]: %s", apiResp.Error.Type,
-			apiResp.Error.Message,
-		)
+
+		if apiResp.Error != nil {
+			if opts.jsonOutput {
+				fmt.Println(string(respBody))
+			}
+			return fmt.Errorf("API error [%s]: %s",
+				apiResp.Error.Type, apiResp.Error.Message)
+		}
+
+		// Update token counts
+		cfg.TotalInput += apiResp.Usage.InputTokens
+		cfg.TotalOutput += apiResp.Usage.OutputTokens
+
+		if opts.verbose {
+			fmt.Fprintf(os.Stderr, "Tokens: %d in, %d out\n",
+				apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens)
+		}
+
+		// Add assistant response to messages
+		messages = append(messages, MessageContent{
+			Role:    "assistant",
+			Content: apiResp.Content,
+		})
+
+		// Check stop reason
+		if apiResp.StopReason == "end_turn" {
+			// Done, extract text and save
+			assistantText := extractResponse(apiResp)
+
+			cfg.UpdatedAt = time.Now().Format(time.RFC3339)
+			if cfg.CreatedAt == "" {
+				cfg.CreatedAt = cfg.UpdatedAt
+			}
+
+			ctx.Messages = append(ctx.Messages, Message{
+				Role:    "assistant",
+				Content: assistantText,
+			})
+
+			if err := saveJSON(contextPath, ctx); err != nil {
+				return fmt.Errorf("saving context: %w", err)
+			}
+
+			historyPath := filepath.Join(claudeDir, "history.json")
+			if err := appendHistory(historyPath, userMsg,
+				assistantText); err != nil {
+				return fmt.Errorf("saving history: %w", err)
+			}
+
+			if err := saveJSON(configPath, cfg); err != nil {
+				return fmt.Errorf("saving config: %w", err)
+			}
+
+			return writeOutput(opts.outputFile, opts.jsonOutput,
+				assistantText, respBody)
+		}
+
+		if apiResp.StopReason == "tool_use" {
+			// Execute tools and continue
+			toolResults := []ContentBlock{}
+
+			for _, content := range apiResp.Content {
+				if content.Type == "tool_use" {
+					result, err := executeTool(content, workingDir, opts)
+					if err != nil {
+						return fmt.Errorf("tool error: %w", err)
+					}
+					toolResults = append(toolResults, result)
+				}
+			}
+
+			// Add tool results as user message
+			messages = append(messages, MessageContent{
+				Role:    "user",
+				Content: toolResults,
+			})
+
+			// Continue loop for next API call
+			continue
+		}
+
+		return fmt.Errorf("unexpected stop_reason: %s", apiResp.StopReason)
 	}
 
-	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "Tokens: %d in, %d out (total: %d in, %d out)\n",
-			apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
-			cfg.TotalInput, cfg.TotalOutput)
-	}
-
-	assistantText := extractResponse(apiResp)
-
-	cfg.TotalInput += apiResp.Usage.InputTokens
-	cfg.TotalOutput += apiResp.Usage.OutputTokens
-	cfg.UpdatedAt = time.Now().Format(time.RFC3339)
-	if cfg.CreatedAt == "" {
-		cfg.CreatedAt = cfg.UpdatedAt
-	}
-
-	ctx.Messages = append(ctx.Messages, Message{
-		Role:    "assistant",
-		Content: assistantText,
-	})
-
-	if err := saveJSON(contextPath, ctx); err != nil {
-		return fmt.Errorf("saving context: %w", err)
-	}
-
-	historyPath := filepath.Join(claudeDir, "history.json")
-	if err := appendHistory(
-		historyPath,
-		userMsg,
-		assistantText,
-	); err != nil {
-		return fmt.Errorf("saving history: %w", err)
-	}
-
-	if err := saveJSON(configPath, cfg); err != nil {
-		return fmt.Errorf("saving config: %w", err)
-	}
-
-	return writeOutput(opts.outputFile, opts.jsonOutput, assistantText, respBody)
+	return fmt.Errorf("max tool iterations reached")
 }
 
 func parseFlags() *options {
 	opts := &options{}
 
 	flag.BoolVar(&opts.debug, "debug", false, "debug output")
+	flag.BoolVar(&opts.execute, "execute", false,
+		"actually execute tool operations (default: dry-run)")
 	flag.BoolVar(&opts.jsonOutput, "json", false, "output raw JSON")
 	flag.BoolVar(&opts.listModels, "list-models", false,
 		"list supported Claude models")
 	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
 		"max tokens for prompt")
 	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
+	flag.BoolVar(&opts.noTools, "no-tools", false, "disable tool use (chat only)")
 	flag.StringVar(&opts.outputFile, "o", "", "write output to file (default stdout)")
 	flag.BoolVar(&opts.reset, "reset", false,
 		"reset conversation (delete .claude/ directory)")
@@ -357,12 +425,13 @@ func readInput() (string, error) {
 	return msg, nil
 }
 
-func callAPI(client *http.Client, apiKey string, model string, maxTokens int, system string, messages []Message, opts *options) (*APIResponse, []byte, error) {
+func callAPI(client *http.Client, apiKey string, model string, maxTokens int, system string, messages []MessageContent, opts *options) (*APIResponse, []byte, error) {
 	apiReq := APIRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  messages,
+		Tools:     getTools(opts),
 	}
 
 	reqBody, err := json.Marshal(apiReq)
@@ -565,4 +634,160 @@ func estimateTokens(messages []Message) int {
 		total += len(msg.Content) / 4
 	}
 	return total
+}
+
+func getTools(opts *options) []Tool {
+	if opts.noTools {
+		return nil
+	}
+
+	return []Tool{{
+		Name:        "read_file",
+		Description: "Read the contents of a file",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]string{
+					"type":        "string",
+					"description": "Path to the file to read",
+				},
+			},
+			"required": []string{"path"},
+		},
+	}, {
+		Name:        "write_file",
+		Description: "Write content to a file. Shows diff in dry-run mode.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]string{
+					"type":        "string",
+					"description": "Path to the file to write",
+				},
+				"content": map[string]string{
+					"type":        "string",
+					"description": "Content to write to the file",
+				},
+			},
+			"required": []string{"path", "content"},
+		},
+	}}
+}
+
+func executeTool(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+	switch toolUse.Name {
+	case "read_file":
+		return executeReadFile(toolUse, workingDir, opts)
+	case "write_file":
+		return executeWriteFile(toolUse, workingDir, opts)
+	default:
+		return ContentBlock{}, fmt.Errorf("unknown tool: %s", toolUse.Name)
+	}
+}
+
+func executeReadFile(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+	path, ok := toolUse.Input["path"].(string)
+	if !ok {
+		return makeToolError(toolUse.ID, "path must be a string")
+	}
+
+	if !isSafePath(path, workingDir) {
+		return makeToolError(toolUse.ID,
+			fmt.Sprintf("path outside project: %s", path))
+	}
+
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Tool: read_file(%s)\n", path)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return makeToolError(toolUse.ID, err.Error())
+	}
+
+	return ContentBlock{
+		Type:      "tool_result",
+		ToolUseID: toolUse.ID,
+		Content:   string(content),
+	}, nil
+}
+
+func executeWriteFile(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+	path, ok := toolUse.Input["path"].(string)
+	if !ok {
+		return makeToolError(toolUse.ID, "path must be a string")
+	}
+
+	content, ok := toolUse.Input["content"].(string)
+	if !ok {
+		return makeToolError(toolUse.ID, "content must be a string")
+	}
+
+	if !isSafePath(path, workingDir) {
+		return makeToolError(toolUse.ID,
+			fmt.Sprintf("path outside project: %s", path))
+	}
+
+	old, _ := os.ReadFile(path)
+
+	fmt.Fprintf(os.Stderr, "\n=== %s ===\n", path)
+	showDiff(string(old), content)
+
+	if !opts.execute {
+		fmt.Fprintf(os.Stderr, "(dry-run: use -execute to apply)\n\n")
+		return ContentBlock{
+			Type:      "tool_result",
+			ToolUseID: toolUse.ID,
+			Content:   "Dry-run: changes not applied. Use -execute flag.",
+		}, nil
+	}
+
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Tool: write_file(%s)\n", path)
+	}
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return makeToolError(toolUse.ID, err.Error())
+	}
+
+	return ContentBlock{
+		Type:      "tool_result",
+		ToolUseID: toolUse.ID,
+		Content:   fmt.Sprintf("Successfully wrote to %s", path),
+	}, nil
+}
+
+func isSafePath(path, workingDir string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(abs, workingDir)
+}
+
+func showDiff(old, new string) {
+	fmt.Fprintf(os.Stderr, "--- old\n+++ new\n")
+	// Simple line-by-line diff (could use proper diff lib later)
+	fmt.Fprintf(os.Stderr, "%s\n", new)
+}
+
+func makeToolError(toolUseID, errMsg string) (ContentBlock, error) {
+	return ContentBlock{
+		Type:      "tool_result",
+		ToolUseID: toolUseID,
+		Content:   fmt.Sprintf("Error: %s", errMsg),
+	}, nil
+}
+
+func convertToMessageContent(messages []Message) []MessageContent {
+	result := make([]MessageContent, len(messages))
+	for i, msg := range messages {
+		result[i] = MessageContent{
+			Role: msg.Role,
+			Content: []ContentBlock{
+				{Type: "text", Text: msg.Content},
+			},
+		}
+	}
+	return result
 }
