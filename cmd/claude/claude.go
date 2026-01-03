@@ -134,10 +134,7 @@ func run() error {
 	selectedModel := selectModel(opts.model, cfg.Model)
 	cfg.Model = selectedModel
 
-	sysPrompt := selectSystemPrompt(
-		opts.systemPrompt,
-		cfg.SystemPrompt,
-	)
+	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
 
 	userMsg, err := readInput()
 	if err != nil {
@@ -289,10 +286,7 @@ func getClaudeDir(resumeDir string) (string, error) {
 		var err error
 		dir, err = os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf(
-				"getting cwd: %w",
-				err,
-			)
+			return "", fmt.Errorf("getting cwd: %w", err)
 		}
 	}
 	return filepath.Join(dir, ".claude"), nil
@@ -396,44 +390,22 @@ func checkHTTPStatus(status int, body []byte) error {
 	case http.StatusOK:
 		return nil
 	case http.StatusBadRequest:
-		return fmt.Errorf(
-			"bad request (400): %s",
-			string(body),
-		)
+		return fmt.Errorf("bad request (400): %s", string(body))
 	case http.StatusUnauthorized:
 		return fmt.Errorf(
-			"unauthorized (401): check API key",
-		)
+			"unauthorized (401): check API key")
 	case http.StatusForbidden:
-		return fmt.Errorf(
-			"forbidden (403): %s",
-			string(body),
-		)
+		return fmt.Errorf("forbidden (403): %s", string(body))
 	case http.StatusNotFound:
-		return fmt.Errorf(
-			"not found (404): invalid endpoint",
-		)
+		return fmt.Errorf("not found (404): invalid endpoint")
 	case http.StatusTooManyRequests:
-		return fmt.Errorf(
-			"rate limited (429): %s",
-			string(body),
-		)
+		return fmt.Errorf("rate limited (429): %s", string(body))
 	case http.StatusInternalServerError:
-		return fmt.Errorf(
-			"server error (500): %s",
-			string(body),
-		)
+		return fmt.Errorf("server error (500): %s", string(body))
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf(
-			"service unavailable (503): %s",
-			string(body),
-		)
+		return fmt.Errorf("service unavailable (503): %s", string(body))
 	default:
-		return fmt.Errorf(
-			"unexpected status %d: %s",
-			status,
-			string(body),
-		)
+		return fmt.Errorf("unexpected status %d: %s", status, string(body))
 	}
 }
 
@@ -462,12 +434,7 @@ func appendHistory(
 	return saveJSON(path, hist)
 }
 
-func writeOutput(
-	outputFile string,
-	jsonOutput bool,
-	assistantText string,
-	respBody []byte,
-) error {
+func writeOutput(outputFile string, jsonOutput bool, assistantText string, respBody []byte) error {
 	var output string
 	if jsonOutput {
 		output = string(respBody)
@@ -477,16 +444,9 @@ func writeOutput(
 
 	switch {
 	case outputFile != "":
-		err := os.WriteFile(
-			outputFile,
-			[]byte(output),
-			0o644,
-		)
+		err := os.WriteFile(outputFile, []byte(output), 0o644)
 		if err != nil {
-			return fmt.Errorf(
-				"writing output file: %w",
-				err,
-			)
+			return fmt.Errorf("writing output file: %w", err)
 		}
 	default:
 		fmt.Println(output)
