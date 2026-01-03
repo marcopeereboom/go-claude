@@ -18,11 +18,13 @@ import (
 )
 
 const (
-	defaultModel        = "claude-sonnet-4-5-20250929"
-	apiURL              = "https://api.anthropic.com/v1/messages"
-	apiVersion          = "2023-06-01"
-	maxContextTokens    = 100000
-	defaultSystemPrompt = `You are a helpful coding assistant. Always wrap:
+	defaultModel         = "claude-sonnet-4-5-20250929"
+	apiURL               = "https://api.anthropic.com/v1/messages"
+	apiVersion           = "2023-06-01"
+	maxContextTokens     = 100000
+	defaultMaxIterations = 15
+	defaultMaxCost       = 1.0 // dollars
+	defaultSystemPrompt  = `You are a helpful coding assistant. Always wrap:
 - Filenames in backticks with language: ` + "```go filename.go```" + `
 - Code blocks in triple backticks with language specified
 - Shell commands in ` + "```bash```" + ` blocks
@@ -99,27 +101,49 @@ type History struct {
 	Messages []Message `json:"messages"`
 }
 
-type Context struct {
+type Conversation struct {
 	Messages []Message `json:"messages"`
 }
 
 // CLI options
 type options struct {
-	debug        bool
-	execute      bool
-	jsonOutput   bool
-	listModels   bool
-	maxTokens    int
-	model        string
-	noTools      bool
-	outputFile   string
-	reset        bool
-	resumeDir    string
-	showStats    bool
-	timeout      int
-	systemPrompt string
-	truncate     int
-	verbose      bool
+	debug         bool
+	execute       bool
+	jsonOutput    bool
+	listModels    bool
+	maxCost       float64
+	maxIterations int
+	maxTokens     int
+	model         string
+	noTools       bool
+	outputFile    string
+	reset         bool
+	resumeDir     string
+	showStats     bool
+	timeout       int
+	systemPrompt  string
+	truncate      int
+	verbose       bool
+}
+
+// session holds all state needed for a conversation execution.
+type session struct {
+	opts       *options
+	claudeDir  string
+	apiKey     string
+	config     *Config
+	model      string
+	sysPrompt  string
+	userMsg    string
+	convo      *Conversation
+	workingDir string
+	client     *http.Client
+}
+
+// conversationResult holds the outcome of a conversation execution.
+type conversationResult struct {
+	assistantText string
+	respBody      []byte
 }
 
 func main() {
@@ -132,6 +156,7 @@ func main() {
 func run() error {
 	opts := parseFlags()
 
+	// Handle special modes that don't need full setup
 	if opts.listModels {
 		return listModels()
 	}
@@ -140,6 +165,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
 	if opts.showStats {
 		return showStats(claudeDir)
 	}
@@ -148,182 +174,37 @@ func run() error {
 		return resetConversation(claudeDir, opts.verbose)
 	}
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		return fmt.Errorf("ANTHROPIC_API_KEY not set")
-	}
-
-	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
-		return fmt.Errorf("creating .claude dir: %w", err)
-	}
-
-	configPath := filepath.Join(claudeDir, "config.json")
-	cfg, err := loadConfig(configPath)
+	// Initialize session
+	sess, err := initSession(opts, claudeDir)
 	if err != nil {
 		return err
 	}
 
-	selectedModel := selectModel(opts.model, cfg.Model)
-	cfg.Model = selectedModel
-
-	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
-
-	userMsg, err := readInput()
+	// Execute conversation with tool support
+	result, err := executeConversation(sess)
 	if err != nil {
 		return err
 	}
 
-	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
-		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
-	}
-
-	contextPath := filepath.Join(claudeDir, "context.json")
-	// TODO don't use context or ctx sice those are implicitely reserved by
-	// context.Context
-	context, err := loadContext(contextPath)
-	if err != nil {
-		return err
-	}
-	if opts.verbose {
-		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n",
-			len(context.Messages))
-	}
-	if opts.truncate > 0 && len(context.Messages) > opts.truncate {
-		if opts.verbose {
-			fmt.Fprintf(os.Stderr, "Truncating context: %d → %d messages\n",
-				len(context.Messages), opts.truncate)
-		}
-		context.Messages = context.Messages[len(context.Messages)-opts.truncate:]
-	}
-
-	context.Messages = append(context.Messages, Message{
-		Role:    "user",
-		Content: userMsg,
-	})
-
-	estimatedTokens := estimateTokens(context.Messages)
-	if estimatedTokens > maxContextTokens {
-		return fmt.Errorf(
-			"context too large (%d tokens, max %d)\n"+
-				"Options:\n"+
-				"  claude --reset           # start fresh conversation\n"+
-				"  claude --truncate N      # keep last N messages\n"+
-				"  (auto-summarize coming later)",
-			estimatedTokens, maxContextTokens)
-	}
-
-	client := &http.Client{
-		Timeout: time.Duration(opts.timeout) * time.Second,
-	}
-
-	// Tool loop
-	workingDir, _ := os.Getwd()
-	messages := convertToMessageContent(context.Messages)
-
-	for i := 0; i < 10; i++ { // Max 10 tool iterations
-		apiResp, respBody, err := callAPI(client, apiKey, selectedModel,
-			opts.maxTokens, sysPrompt, messages, opts)
-		if err != nil {
-			return err
-		}
-
-		if apiResp.Error != nil {
-			if opts.jsonOutput {
-				fmt.Println(string(respBody))
-			}
-			return fmt.Errorf("API error [%s]: %s",
-				apiResp.Error.Type, apiResp.Error.Message)
-		}
-
-		// Update token counts
-		cfg.TotalInput += apiResp.Usage.InputTokens
-		cfg.TotalOutput += apiResp.Usage.OutputTokens
-
-		if opts.verbose {
-			fmt.Fprintf(os.Stderr, "Tokens: %d in, %d out\n",
-				apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens)
-		}
-
-		// Add assistant response to messages
-		messages = append(messages, MessageContent{
-			Role:    "assistant",
-			Content: apiResp.Content,
-		})
-
-		// Check stop reason
-		if apiResp.StopReason == "end_turn" {
-			// Done, extract text and save
-			assistantText := extractResponse(apiResp)
-
-			cfg.UpdatedAt = time.Now().Format(time.RFC3339)
-			if cfg.CreatedAt == "" {
-				cfg.CreatedAt = cfg.UpdatedAt
-			}
-
-			context.Messages = append(context.Messages, Message{
-				Role:    "assistant",
-				Content: assistantText,
-			})
-
-			// TODO: Use append-only writes to survive crashes
-			if err := saveJSON(contextPath, context); err != nil {
-				return fmt.Errorf("saving context: %w", err)
-			}
-
-			historyPath := filepath.Join(claudeDir, "history.json")
-			if err := appendHistory(historyPath, userMsg,
-				assistantText); err != nil {
-				return fmt.Errorf("saving history: %w", err)
-			}
-
-			if err := saveJSON(configPath, cfg); err != nil {
-				return fmt.Errorf("saving config: %w", err)
-			}
-
-			return writeOutput(opts.outputFile, opts.jsonOutput,
-				assistantText, respBody)
-		}
-
-		if apiResp.StopReason == "tool_use" {
-			// Execute tools and continue
-			toolResults := []ContentBlock{}
-
-			for _, content := range apiResp.Content {
-				if content.Type == "tool_use" {
-					result, err := executeTool(content, workingDir, opts)
-					if err != nil {
-						return fmt.Errorf("tool error: %w", err)
-					}
-					toolResults = append(toolResults, result)
-				}
-			}
-
-			// Add tool results as user message
-			messages = append(messages, MessageContent{
-				Role:    "user",
-				Content: toolResults,
-			})
-
-			// Continue loop for next API call
-			continue
-		}
-
-		return fmt.Errorf("unexpected stop_reason: %s", apiResp.StopReason)
-	}
-
-	return fmt.Errorf("max tool iterations reached")
+	// Save and output results
+	return finalizeSession(sess, result)
 }
 
 func parseFlags() *options {
 	opts := &options{}
 
+	// TODO: add defaults everywhere and print them. Add a preamble and
+	// examples to help as well.
 	flag.BoolVar(&opts.debug, "debug", false, "debug output")
 	flag.BoolVar(&opts.execute, "execute", false,
 		"actually execute tool operations (default: dry-run)")
 	flag.BoolVar(&opts.jsonOutput, "json", false, "output raw JSON")
 	flag.BoolVar(&opts.listModels, "list-models", false,
 		"list supported Claude models")
+	flag.Float64Var(&opts.maxCost, "max-cost", defaultMaxCost,
+		"max cost in dollars per conversation (0 = unlimited)")
+	flag.IntVar(&opts.maxIterations, "max-iterations", defaultMaxIterations,
+		"max tool loop iterations (0 = unlimited)")
 	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
 		"max tokens for prompt")
 	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
@@ -371,7 +252,7 @@ func listModels() error {
 func showStats(claudeDir string) error {
 	cfg, _ := loadConfig(filepath.Join(claudeDir, "config.json"))
 	hist, _ := loadHistory(filepath.Join(claudeDir, "history.json"))
-	ctx, _ := loadContext(filepath.Join(claudeDir, "context.json"))
+	convo, _ := loadConversation(filepath.Join(claudeDir, "conversation.json"))
 
 	fmt.Fprintf(os.Stderr, "Project: %s\n", claudeDir)
 	fmt.Fprintf(os.Stderr, "Model: %s\n", cfg.Model)
@@ -381,11 +262,248 @@ func showStats(claudeDir string) error {
 		float64(cfg.TotalInput)*3.0/1000000+
 			float64(cfg.TotalOutput)*15.0/1000000)
 	fmt.Fprintf(os.Stderr, "History: %d messages\n", len(hist.Messages))
-	fmt.Fprintf(os.Stderr, "Context: %d messages\n", len(ctx.Messages))
+	fmt.Fprintf(os.Stderr, "Conversation: %d messages\n", len(convo.Messages))
 	fmt.Fprintf(os.Stderr, "Created: %s\n", cfg.CreatedAt)
 	fmt.Fprintf(os.Stderr, "Updated: %s\n", cfg.UpdatedAt)
 
 	return nil
+}
+
+// initSession sets up all state needed for a conversation.
+func initSession(opts *options, claudeDir string) (*session, error) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
+	}
+
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating .claude dir: %w", err)
+	}
+
+	// Load configuration
+	configPath := filepath.Join(claudeDir, "config.json")
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedModel := selectModel(opts.model, cfg.Model)
+	cfg.Model = selectedModel
+
+	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
+
+	// Read user input
+	userMsg, err := readInput()
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
+		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
+	}
+
+	// Load and prepare conversation
+	convoPath := filepath.Join(claudeDir, "conversation.json")
+	convo, err := loadConversation(convoPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "Loaded %d messages\n", len(convo.Messages))
+	}
+
+	// Handle truncation
+	if opts.truncate > 0 && len(convo.Messages) > opts.truncate {
+		if opts.verbose {
+			fmt.Fprintf(os.Stderr, "Truncating: %d → %d messages\n",
+				len(convo.Messages), opts.truncate)
+		}
+		convo.Messages = convo.Messages[len(convo.Messages)-opts.truncate:]
+	}
+
+	// Add user message
+	convo.Messages = append(convo.Messages, Message{
+		Role:    "user",
+		Content: userMsg,
+	})
+
+	// Check context size
+	estimatedTokens := estimateTokens(convo.Messages)
+	if estimatedTokens > maxContextTokens {
+		return nil, fmt.Errorf(
+			"conversation too large (%d tokens, max %d)\n"+
+				"Options:\n"+
+				"  claude --reset           # start fresh\n"+
+				"  claude --truncate N      # keep last N messages",
+			estimatedTokens, maxContextTokens)
+	}
+
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("getting working dir: %w", err)
+	}
+
+	return &session{
+		opts:       opts,
+		claudeDir:  claudeDir,
+		apiKey:     apiKey,
+		config:     cfg,
+		model:      selectedModel,
+		sysPrompt:  sysPrompt,
+		userMsg:    userMsg,
+		convo:      convo,
+		workingDir: workingDir,
+		client: &http.Client{
+			Timeout: time.Duration(opts.timeout) * time.Second,
+		},
+	}, nil
+}
+
+// executeConversation runs the agentic loop with tool support.
+func executeConversation(sess *session) (*conversationResult, error) {
+	messages := convertToMessageContent(sess.convo.Messages)
+	iterationCost := 0.0
+
+	maxIter := sess.opts.maxIterations
+	if maxIter == 0 {
+		maxIter = 1000 // Effective unlimited
+	}
+
+	// Agentic loop: iterate until Claude is done or limits reached
+	for i := 0; i < maxIter; i++ {
+		apiResp, respBody, err := callAPI(sess.client, sess.apiKey,
+			sess.model, sess.opts.maxTokens, sess.sysPrompt, messages,
+			sess.opts)
+		if err != nil {
+			return nil, err
+		}
+
+		if apiResp.Error != nil {
+			if sess.opts.jsonOutput {
+				fmt.Println(string(respBody))
+			}
+			return nil, fmt.Errorf("API error [%s]: %s",
+				apiResp.Error.Type, apiResp.Error.Message)
+		}
+
+		// Track cost this iteration
+		costIn := float64(apiResp.Usage.InputTokens) * 3.0 / 1000000
+		costOut := float64(apiResp.Usage.OutputTokens) * 15.0 / 1000000
+		iterationCost += costIn + costOut
+
+		// Check cost limit
+		if sess.opts.maxCost > 0 && iterationCost > sess.opts.maxCost {
+			return nil, fmt.Errorf(
+				"max cost exceeded ($%.4f > $%.4f) after %d iterations",
+				iterationCost, sess.opts.maxCost, i+1)
+		}
+
+		// Update token counts
+		sess.config.TotalInput += apiResp.Usage.InputTokens
+		sess.config.TotalOutput += apiResp.Usage.OutputTokens
+
+		if sess.opts.verbose {
+			fmt.Fprintf(os.Stderr,
+				"Iteration %d - Tokens: %d in, %d out (cost: $%.4f)\n",
+				i+1, apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
+				costIn+costOut)
+		}
+
+		// Add assistant response to messages
+		messages = append(messages, MessageContent{
+			Role:    "assistant",
+			Content: apiResp.Content,
+		})
+
+		// Handle different stop reasons
+		switch apiResp.StopReason {
+		case "end_turn":
+			// Conversation complete
+			assistantText := extractResponse(apiResp)
+			sess.convo.Messages = append(sess.convo.Messages, Message{
+				Role:    "assistant",
+				Content: assistantText,
+			})
+			return &conversationResult{
+				assistantText: assistantText,
+				respBody:      respBody,
+			}, nil
+
+		case "tool_use":
+			// Execute tools and continue
+			toolResults, err := executeTools(apiResp.Content,
+				sess.workingDir, sess.opts)
+			if err != nil {
+				return nil, err
+			}
+
+			messages = append(messages, MessageContent{
+				Role:    "user",
+				Content: toolResults,
+			})
+			// Continue loop
+
+		default:
+			return nil, fmt.Errorf("unexpected stop_reason: %s",
+				apiResp.StopReason)
+		}
+	}
+
+	return nil, fmt.Errorf("max iterations (%d) reached", maxIter)
+}
+
+// executeTools processes all tool use requests in the response.
+func executeTools(content []ContentBlock, workingDir string,
+	opts *options,
+) ([]ContentBlock, error) {
+	results := []ContentBlock{}
+	for _, block := range content {
+		if block.Type == "tool_use" {
+			result, err := executeTool(block, workingDir, opts)
+			if err != nil {
+				return nil, fmt.Errorf("tool error: %w", err)
+			}
+			results = append(results, result)
+		}
+	}
+	return results, nil
+}
+
+// finalizeSession saves all state and outputs the result.
+func finalizeSession(sess *session, result *conversationResult) error {
+	// Update timestamps
+	sess.config.UpdatedAt = time.Now().Format(time.RFC3339)
+	if sess.config.CreatedAt == "" {
+		sess.config.CreatedAt = sess.config.UpdatedAt
+	}
+
+	// Save conversation
+	// TODO: Use append-only writes to survive crashes
+	convoPath := filepath.Join(sess.claudeDir, "conversation.json")
+	if err := saveJSON(convoPath, sess.convo); err != nil {
+		return fmt.Errorf("saving conversation: %w", err)
+	}
+
+	// Save history
+	historyPath := filepath.Join(sess.claudeDir, "history.json")
+	if err := appendHistory(historyPath, sess.userMsg,
+		result.assistantText); err != nil {
+		return fmt.Errorf("saving history: %w", err)
+	}
+
+	// Save config
+	configPath := filepath.Join(sess.claudeDir, "config.json")
+	if err := saveJSON(configPath, sess.config); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
+	// Output result
+	// TODO: add syntax highligted md and code blocks when printing to
+	// terminal. Do not write escape codes to any files ever.
+	return writeOutput(sess.opts.outputFile, sess.opts.jsonOutput,
+		result.assistantText, result.respBody)
 }
 
 func getClaudeDir(resumeDir string) (string, error) {
@@ -500,7 +618,8 @@ func checkHTTPStatus(status int, body []byte) error {
 	var apiErr struct {
 		Error *APIError `json:"error"`
 	}
-	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error != nil {
+	if err := json.Unmarshal(body, &apiErr); err == nil &&
+		apiErr.Error != nil {
 		return fmt.Errorf("API error [%s]: %s",
 			apiErr.Error.Type, apiErr.Error.Message)
 	}
@@ -594,21 +713,21 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func loadContext(path string) (*Context, error) {
-	context := &Context{Messages: []Message{}}
+func loadConversation(path string) (*Conversation, error) {
+	convo := &Conversation{Messages: []Message{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return context, nil
+			return convo, nil
 		}
-		return nil, fmt.Errorf("reading context: %w", err)
+		return nil, fmt.Errorf("reading conversation: %w", err)
 	}
 
-	if err := json.Unmarshal(data, context); err != nil {
-		return nil, fmt.Errorf("parsing context: %w", err)
+	if err := json.Unmarshal(data, convo); err != nil {
+		return nil, fmt.Errorf("parsing conversation: %w", err)
 	}
 
-	return context, nil
+	return convo, nil
 }
 
 func loadHistory(path string) (*History, error) {
@@ -707,7 +826,8 @@ func executeTool(toolUse ContentBlock, workingDir string,
 	case "write_file":
 		return executeWriteFile(toolUse, workingDir, opts)
 	default:
-		return ContentBlock{}, fmt.Errorf("unknown tool: %s", toolUse.Name)
+		return ContentBlock{}, fmt.Errorf("unknown tool: %s",
+			toolUse.Name)
 	}
 }
 
@@ -768,7 +888,8 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 		return ContentBlock{
 			Type:      "tool_result",
 			ToolUseID: toolUse.ID,
-			Content:   "Dry-run: changes not applied. Use --execute flag.",
+			Content: "Dry-run: changes not applied. " +
+				"Use --execute flag.",
 		}, nil
 	}
 
