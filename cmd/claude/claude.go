@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,12 +13,14 @@ import (
 )
 
 const (
-	claudeAPIURL        = "https://api.anthropic.com/v1/messages"
-	modelsAPIURL        = "https://api.anthropic.com/v1/models"
 	defaultModel        = "claude-sonnet-4-5-20250929"
-	conversationDirName = ".claude"
-	conversationFile    = "claude_conversation.json"
-	modelFile           = "claude_model.json"
+	apiURL              = "https://api.anthropic.com/v1/messages"
+	apiVersion          = "2023-06-01"
+	defaultSystemPrompt = `You are a helpful coding assistant. Always wrap:
+- Filenames in backticks with language: ` + "```go filename.go```" + `
+- Code blocks in triple backticks with language specified
+- Shell commands in ` + "```bash```" + ` blocks
+This helps with automated extraction and saving.`
 )
 
 type Message struct {
@@ -28,304 +28,523 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-type ConversationLogEntry struct {
-	Request   json.RawMessage `json:"request"`
-	Response  json.RawMessage `json:"response"`
-	Timestamp string          `json:"timestamp"`
+type APIRequest struct {
+	Model     string    `json:"model"`
+	MaxTokens int       `json:"max_tokens"`
+	System    string    `json:"system,omitempty"`
+	Messages  []Message `json:"messages"`
 }
 
-// stdinIsPiped returns true if stdin is piped
-func stdinIsPiped() bool {
-	info, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice == 0
+type APIResponse struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Role    string `json:"role"`
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Model      string    `json:"model"`
+	StopReason string    `json:"stop_reason"`
+	Usage      Usage     `json:"usage"`
+	Error      *APIError `json:"error,omitempty"`
+}
+
+type APIError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+type Config struct {
+	Model        string `json:"model"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	TotalInput   int    `json:"total_input_tokens"`
+	TotalOutput  int    `json:"total_output_tokens"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+}
+
+type History struct {
+	Messages []Message `json:"messages"`
+}
+
+type Context struct {
+	Messages []Message `json:"messages"`
+}
+
+type options struct {
+	jsonOutput   bool
+	listModels   bool
+	maxTokens    int
+	model        string
+	outputFile   string
+	resumeDir    string
+	timeout      int
+	systemPrompt string
 }
 
 func main() {
-	flagJSON := flag.Bool("json", false, "output raw JSON")
-	flagList := flag.Bool("list-models", false, "list supported Claude models")
-	flagMaxTokens := flag.Int("max-tokens", 1000, "max tokens for prompt")
-	flagModel := flag.String("model", defaultModel, "model id for single prompt")
-	flagOut := flag.String("o", "", "write output to file (default stdout)")
-	flagResume := flag.String("r", "", "directory to resume/save conversation context (defaults to cwd)")
-	flagTimeout := flag.Int("timeout", 30, "timeout in seconds")
-	flagSystem := flag.String("system", "", "override default system prompt")
-	flag.Parse()
-
-	if err := runCLI(*flagJSON, *flagList, *flagMaxTokens, *flagModel, *flagOut, *flagResume, *flagTimeout, *flagSystem); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runCLI(jsonFlag, listModelsFlag bool, maxTokens int, model, outFile, resumeDir string, timeout int, systemFlag string) error {
-	apiKey := os.Getenv("CLAUDE_API_KEY")
+func run() error {
+	opts := parseFlags()
+
+	if opts.listModels {
+		return listModels()
+	}
+
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		return fmt.Errorf("CLAUDE_API_KEY not set")
+		return fmt.Errorf("ANTHROPIC_API_KEY not set")
 	}
 
-	if listModelsFlag {
-		return listModels(apiKey, jsonFlag, timeout)
-	}
-
-	if resumeDir == "" {
-		resumeDir = "."
-	}
-	resumeDir = filepath.Clean(resumeDir)
-	convDir := filepath.Join(resumeDir, conversationDirName)
-	if err := os.MkdirAll(convDir, 0o755); err != nil {
-		return fmt.Errorf("creating conversation dir: %w", err)
-	}
-
-	convPath := filepath.Join(convDir, conversationFile)
-	modelPath := filepath.Join(convDir, modelFile)
-
-	// Read stdin prompt
-	var prompt string
-	if stdinIsPiped() {
-		promptBytes, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("reading stdin: %w", err)
-		}
-		prompt = string(bytes.TrimSpace(promptBytes))
-	} else {
-		prompt = ""
-	}
-
-	if prompt == "" {
-		return fmt.Errorf("no input provided")
-	}
-
-	// Load conversation
-	messages, err := loadConversationContext(convPath)
-	if err != nil {
-		return fmt.Errorf("loading conversation: %w", err)
-	}
-
-	// Append current user message
-	messages = append(messages, Message{Role: "user", Content: prompt})
-
-	// Determine system prompt
-	systemPrompt := "Always label code blocks with filenames: ```language filename"
-	if systemFlag != "" {
-		systemPrompt = systemFlag
-	}
-
-	reqBody := map[string]interface{}{
-		"model":      model,
-		"messages":   messages,
-		"system":     systemPrompt,
-		"max_tokens": maxTokens,
-	}
-
-	reqBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("marshaling request: %w", err)
-	}
-
-	respBytes, err := callClaude(apiKey, reqBytes, timeout)
+	claudeDir, err := getClaudeDir(opts.resumeDir)
 	if err != nil {
 		return err
 	}
 
-	// Output
-	outF := os.Stdout
-	if outFile != "" {
-		f, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return fmt.Errorf("opening output file: %w", err)
-		}
-		defer f.Close()
-		outF = f
+	// TODO audit all errors, these duplicate text, e.g. mkdir returns
+	// already a readable error.
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		return fmt.Errorf("creating .claude dir: %w", err)
 	}
 
-	if jsonFlag {
-		if _, err := outF.Write(append(respBytes, '\n')); err != nil {
-			return fmt.Errorf("writing output: %w", err)
-		}
-	} else {
-		var respObj struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		}
-		if err := json.Unmarshal(respBytes, &respObj); err != nil {
-			if _, err2 := outF.Write(append(respBytes, '\n')); err2 != nil {
-				return fmt.Errorf("writing raw output: %w", err2)
-			}
-		} else {
-			for _, c := range respObj.Content {
-				if _, err := fmt.Fprintln(outF, c.Text); err != nil {
-					return fmt.Errorf("writing output text: %w", err)
-				}
-			}
-		}
-	}
-
-	if err := appendLogEntry(convPath, reqBytes, respBytes); err != nil {
-		return fmt.Errorf("saving conversation: %w", err)
-	}
-
-	if err := os.WriteFile(modelPath, []byte(model), 0o644); err != nil {
-		return fmt.Errorf("saving model: %w", err)
-	}
-
-	return nil
-}
-
-// listModels lists all available Claude models
-func listModels(apiKey string, jsonFlag bool, timeout int) error {
-	body, err := doRequest(apiKey, http.MethodGet, modelsAPIURL, nil, timeout)
+	configPath := filepath.Join(claudeDir, "config.json")
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
 
-	if jsonFlag {
-		fmt.Println(string(body))
-		return nil
+	selectedModel := selectModel(opts.model, cfg.Model)
+	cfg.Model = selectedModel
+
+	sysPrompt := selectSystemPrompt(
+		opts.systemPrompt,
+		cfg.SystemPrompt,
+	)
+
+	userMsg, err := readInput()
+	if err != nil {
+		return err
 	}
 
-	var parsed struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+	contextPath := filepath.Join(claudeDir, "context.json")
+	// TODO don't use ctx ever, that is essentially a reserved word in go code.
+	ctx, err := loadContext(contextPath)
+	if err != nil {
+		return err
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		fmt.Println(string(body))
-		return nil
+
+	ctx.Messages = append(ctx.Messages, Message{
+		Role:    "user",
+		Content: userMsg,
+	})
+
+	client := &http.Client{
+		Timeout: time.Duration(opts.timeout) * time.Second,
 	}
-	for _, m := range parsed.Data {
-		fmt.Println(m.ID)
+
+	apiResp, respBody, err := callAPI(
+		client,
+		apiKey,
+		selectedModel,
+		opts.maxTokens,
+		sysPrompt,
+		ctx.Messages,
+	)
+	if err != nil {
+		return err
 	}
+
+	if apiResp.Error != nil {
+		if opts.jsonOutput {
+			fmt.Println(string(respBody))
+		}
+		return fmt.Errorf(
+			"API error [%s]: %s",
+			apiResp.Error.Type,
+			apiResp.Error.Message,
+		)
+	}
+
+	assistantText := extractResponse(apiResp)
+
+	cfg.TotalInput += apiResp.Usage.InputTokens
+	cfg.TotalOutput += apiResp.Usage.OutputTokens
+	cfg.UpdatedAt = time.Now().Format(time.RFC3339)
+	if cfg.CreatedAt == "" {
+		cfg.CreatedAt = cfg.UpdatedAt
+	}
+
+	ctx.Messages = append(ctx.Messages, Message{
+		Role:    "assistant",
+		Content: assistantText,
+	})
+
+	if err := saveJSON(contextPath, ctx); err != nil {
+		return fmt.Errorf("saving context: %w", err)
+	}
+
+	historyPath := filepath.Join(claudeDir, "history.json")
+	if err := appendHistory(
+		historyPath,
+		userMsg,
+		assistantText,
+	); err != nil {
+		return fmt.Errorf("saving history: %w", err)
+	}
+
+	if err := saveJSON(configPath, cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
+	return writeOutput(
+		opts.outputFile,
+		opts.jsonOutput,
+		assistantText,
+		respBody,
+	)
+}
+
+func parseFlags() *options {
+	opts := &options{}
+
+	flag.BoolVar(&opts.jsonOutput, "json", false,
+		"output raw JSON")
+	flag.BoolVar(&opts.listModels, "list-models", false,
+		"list supported Claude models")
+	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
+		"max tokens for prompt")
+	flag.StringVar(&opts.model, "model", "",
+		"model id for single prompt")
+	flag.StringVar(&opts.outputFile, "o", "",
+		"write output to file (default stdout)")
+
+	var resumeDir2 string
+	flag.StringVar(&opts.resumeDir, "r", "",
+		"directory to resume/save conversation context")
+	flag.StringVar(&resumeDir2, "resume", "",
+		"same as -r")
+
+	flag.IntVar(&opts.timeout, "timeout", 30,
+		"timeout in seconds")
+	flag.StringVar(&opts.systemPrompt, "system", "",
+		"custom system prompt")
+
+	flag.Parse()
+
+	if opts.resumeDir == "" {
+		opts.resumeDir = resumeDir2
+	}
+
+	return opts
+}
+
+func listModels() error {
+	// TODO: Query API for models instead of hardcoding
+	fmt.Println("Supported Claude models:")
+	fmt.Println("  claude-opus-4-20250514")
+	fmt.Println("  claude-sonnet-4-5-20250929")
+	fmt.Println("  claude-sonnet-4-20250514")
+	fmt.Println("  claude-haiku-4-5-20251001")
 	return nil
 }
 
-func loadConversationContext(path string) ([]Message, error) {
-	file, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("opening conversation file: %w", err)
-	}
-	defer file.Close()
-
-	var messages []Message
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-		var entry ConversationLogEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-
-		var reqObj struct {
-			Messages []Message `json:"messages"`
-		}
-		if err := json.Unmarshal(entry.Request, &reqObj); err == nil {
-			messages = append(messages, reqObj.Messages...)
-		}
-
-		var respObj struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		}
-		if err := json.Unmarshal(entry.Response, &respObj); err == nil {
-			var combined string
-			for _, c := range respObj.Content {
-				combined += c.Text
-			}
-			if combined != "" {
-				messages = append(messages, Message{Role: "assistant", Content: combined})
-			}
+func getClaudeDir(resumeDir string) (string, error) {
+	dir := resumeDir
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf(
+				"getting cwd: %w",
+				err,
+			)
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading conversation file: %w", err)
-	}
-	return messages, nil
+	return filepath.Join(dir, ".claude"), nil
 }
 
-func appendLogEntry(path string, req, resp []byte) error {
-	entry := ConversationLogEntry{
-		Request:   json.RawMessage(req),
-		Response:  json.RawMessage(resp),
-		Timestamp: time.Now().Format(time.RFC3339),
+func selectModel(flagModel, cfgModel string) string {
+	switch {
+	case flagModel != "":
+		return flagModel
+	case cfgModel != "":
+		return cfgModel
+	default:
+		return defaultModel
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening log file: %w", err)
-	}
-	defer f.Close()
-
-	line, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("marshaling log entry: %w", err)
-	}
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("writing log entry: %w", err)
-	}
-	return nil
 }
 
-// Unified HTTP request function for both prompts and model listing
-func doRequest(apiKey, method, url string, body []byte, timeoutSec int) ([]byte, error) {
-	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
-
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+func selectSystemPrompt(flagPrompt, cfgPrompt string) string {
+	switch {
+	case flagPrompt != "":
+		return flagPrompt
+	case cfgPrompt != "":
+		return cfgPrompt
+	default:
+		return defaultSystemPrompt
 	}
+}
 
-	req, err := http.NewRequest(method, url, reader)
+func readInput() (string, error) {
+	input, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		return "", fmt.Errorf("reading stdin: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	msg := string(input)
+	if msg == "" {
+		return "", fmt.Errorf("no input provided")
+	}
+
+	return msg, nil
+}
+
+func callAPI(
+	client *http.Client,
+	apiKey string,
+	model string,
+	maxTokens int,
+	system string,
+	messages []Message,
+) (*APIResponse, []byte, error) {
+	apiReq := APIRequest{
+		Model:     model,
+		MaxTokens: maxTokens,
+		System:    system,
+		Messages:  messages,
+	}
+
+	reqBody, err := json.Marshal(apiReq)
 	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
+		return nil, nil, fmt.Errorf(
+			"marshaling request: %w",
+			err,
+		)
+	}
+
+	httpReq, err := http.NewRequest(
+		"POST",
+		apiURL,
+		bytes.NewBuffer(reqBody),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"creating request: %w",
+			err,
+		)
+	}
+
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", apiVersion)
+	httpReq.Header.Set("content-type", "application/json")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"making API call: %w",
+			err,
+		)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, nil, fmt.Errorf(
+			"reading response: %w",
+			err,
+		)
 	}
 
-	// Unified error handling
-	switch resp.StatusCode {
+	if err := checkHTTPStatus(resp.StatusCode, respBody); err != nil {
+		return nil, respBody, err
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, nil, fmt.Errorf(
+			"parsing response: %w\nBody: %s",
+			err,
+			string(respBody),
+		)
+	}
+
+	return &apiResp, respBody, nil
+}
+
+func checkHTTPStatus(status int, body []byte) error {
+	switch status {
 	case http.StatusOK:
-		return respBody, nil
+		return nil
+	case http.StatusBadRequest:
+		return fmt.Errorf(
+			"bad request (400): %s",
+			string(body),
+		)
 	case http.StatusUnauthorized:
-		return nil, errors.New("unauthorized: invalid API key")
+		return fmt.Errorf(
+			"unauthorized (401): check API key",
+		)
+	case http.StatusForbidden:
+		return fmt.Errorf(
+			"forbidden (403): %s",
+			string(body),
+		)
 	case http.StatusNotFound:
-		return nil, errors.New("resource not found (404)")
-	case http.StatusUnprocessableEntity:
-		return nil, fmt.Errorf("request could not be processed: %s", string(respBody))
+		return fmt.Errorf(
+			"not found (404): invalid endpoint",
+		)
 	case http.StatusTooManyRequests:
-		return nil, errors.New("rate limit exceeded (429)")
-	case http.StatusInternalServerError, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return nil, fmt.Errorf("server error %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf(
+			"rate limited (429): %s",
+			string(body),
+		)
+	case http.StatusInternalServerError:
+		return fmt.Errorf(
+			"server error (500): %s",
+			string(body),
+		)
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf(
+			"service unavailable (503): %s",
+			string(body),
+		)
 	default:
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf(
+			"unexpected status %d: %s",
+			status,
+			string(body),
+		)
 	}
 }
 
-// callClaude simply calls the unified doRequest
-func callClaude(apiKey string, req []byte, timeoutSec int) ([]byte, error) {
-	return doRequest(apiKey, http.MethodPost, claudeAPIURL, req, timeoutSec)
+func extractResponse(apiResp *APIResponse) string {
+	if len(apiResp.Content) > 0 {
+		return apiResp.Content[0].Text
+	}
+	return ""
+}
+
+func appendHistory(
+	path string,
+	userMsg string,
+	assistantMsg string,
+) error {
+	hist, err := loadHistory(path)
+	if err != nil {
+		return err
+	}
+
+	hist.Messages = append(hist.Messages,
+		Message{Role: "user", Content: userMsg},
+		Message{Role: "assistant", Content: assistantMsg},
+	)
+
+	return saveJSON(path, hist)
+}
+
+func writeOutput(
+	outputFile string,
+	jsonOutput bool,
+	assistantText string,
+	respBody []byte,
+) error {
+	var output string
+	if jsonOutput {
+		output = string(respBody)
+	} else {
+		output = assistantText
+	}
+
+	switch {
+	case outputFile != "":
+		err := os.WriteFile(
+			outputFile,
+			[]byte(output),
+			0o644,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"writing output file: %w",
+				err,
+			)
+		}
+	default:
+		fmt.Println(output)
+	}
+
+	return nil
+}
+
+func loadConfig(path string) (*Config, error) {
+	cfg := &Config{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+func loadContext(path string) (*Context, error) {
+	ctx := &Context{Messages: []Message{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ctx, nil
+		}
+		return nil, fmt.Errorf("reading context: %w", err)
+	}
+
+	if err := json.Unmarshal(data, ctx); err != nil {
+		return nil, fmt.Errorf("parsing context: %w", err)
+	}
+
+	return ctx, nil
+}
+
+func loadHistory(path string) (*History, error) {
+	hist := &History{Messages: []Message{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return hist, nil
+		}
+		return nil, fmt.Errorf("reading history: %w", err)
+	}
+
+	if err := json.Unmarshal(data, hist); err != nil {
+		return nil, fmt.Errorf("parsing history: %w", err)
+	}
+
+	return hist, nil
+}
+
+func saveJSON(path string, v interface{}) error {
+	data, err := json.MarshalIndent(v, "", "\t")
+	if err != nil {
+		return fmt.Errorf("marshaling JSON: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("writing file: %w", err)
+	}
+
+	return nil
 }
