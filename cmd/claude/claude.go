@@ -1,3 +1,5 @@
+// Package main implements a CLI for interacting with Claude AI with tool use,
+// conversation management, and local context storage.
 package main
 
 import (
@@ -27,32 +29,7 @@ const (
 This helps with automated extraction and saving.`
 )
 
-type ContentBlock struct {
-	Type      string                 `json:"type"`
-	Text      string                 `json:"text,omitempty"`
-	ID        string                 `json:"id,omitempty"`
-	Name      string                 `json:"name,omitempty"`
-	Input     map[string]interface{} `json:"input,omitempty"`
-	ToolUseID string                 `json:"tool_use_id,omitempty"`
-	Content   string                 `json:"content,omitempty"`
-}
-
-type MessageContent struct {
-	Role    string         `json:"role"`
-	Content []ContentBlock `json:"content"`
-}
-
-type Tool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
+// API types
 type APIRequest struct {
 	Model     string      `json:"model"`
 	MaxTokens int         `json:"max_tokens"`
@@ -77,9 +54,36 @@ type APIError struct {
 	Message string `json:"message"`
 }
 
+type ContentBlock struct {
+	Type      string                 `json:"type"`
+	Text      string                 `json:"text,omitempty"`
+	ID        string                 `json:"id,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Input     map[string]interface{} `json:"input,omitempty"`
+	ToolUseID string                 `json:"tool_use_id,omitempty"`
+	Content   string                 `json:"content,omitempty"`
+}
+
+type MessageContent struct {
+	Role    string         `json:"role"`
+	Content []ContentBlock `json:"content"`
+}
+
+type Tool struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	InputSchema interface{} `json:"input_schema"`
+}
+
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+// Storage types
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 type Config struct {
@@ -99,6 +103,7 @@ type Context struct {
 	Messages []Message `json:"messages"`
 }
 
+// CLI options
 type options struct {
 	debug        bool
 	execute      bool
@@ -139,7 +144,6 @@ func run() error {
 		return showStats(claudeDir)
 	}
 
-	// Nuke claude dir.
 	if opts.reset {
 		return resetConversation(claudeDir, opts.verbose)
 	}
@@ -149,8 +153,6 @@ func run() error {
 		return fmt.Errorf("ANTHROPIC_API_KEY not set")
 	}
 
-	// TODO audit all errors, these duplicate text, e.g. mkdir returns
-	// already a readable error.
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		return fmt.Errorf("creating .claude dir: %w", err)
 	}
@@ -177,35 +179,36 @@ func run() error {
 	}
 
 	contextPath := filepath.Join(claudeDir, "context.json")
-	// TODO don't use ctx ever, that is essentially a reserved word in go code.
-	ctx, err := loadContext(contextPath)
+	// TODO don't use context or ctx sice those are implicitely reserved by
+	// context.Context
+	context, err := loadContext(contextPath)
 	if err != nil {
 		return err
 	}
 	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n",
-			len(ctx.Messages))
+			len(context.Messages))
 	}
-	if opts.truncate > 0 && len(ctx.Messages) > opts.truncate {
+	if opts.truncate > 0 && len(context.Messages) > opts.truncate {
 		if opts.verbose {
 			fmt.Fprintf(os.Stderr, "Truncating context: %d → %d messages\n",
-				len(ctx.Messages), opts.truncate)
+				len(context.Messages), opts.truncate)
 		}
-		ctx.Messages = ctx.Messages[len(ctx.Messages)-opts.truncate:]
+		context.Messages = context.Messages[len(context.Messages)-opts.truncate:]
 	}
 
-	ctx.Messages = append(ctx.Messages, Message{
+	context.Messages = append(context.Messages, Message{
 		Role:    "user",
 		Content: userMsg,
 	})
 
-	estimatedTokens := estimateTokens(ctx.Messages)
+	estimatedTokens := estimateTokens(context.Messages)
 	if estimatedTokens > maxContextTokens {
 		return fmt.Errorf(
 			"context too large (%d tokens, max %d)\n"+
 				"Options:\n"+
-				"  claude -reset           # start fresh conversation\n"+
-				"  claude -truncate N      # keep last N messages\n"+
+				"  claude --reset           # start fresh conversation\n"+
+				"  claude --truncate N      # keep last N messages\n"+
 				"  (auto-summarize coming later)",
 			estimatedTokens, maxContextTokens)
 	}
@@ -216,7 +219,7 @@ func run() error {
 
 	// Tool loop
 	workingDir, _ := os.Getwd()
-	messages := convertToMessageContent(ctx.Messages)
+	messages := convertToMessageContent(context.Messages)
 
 	for i := 0; i < 10; i++ { // Max 10 tool iterations
 		apiResp, respBody, err := callAPI(client, apiKey, selectedModel,
@@ -258,12 +261,13 @@ func run() error {
 				cfg.CreatedAt = cfg.UpdatedAt
 			}
 
-			ctx.Messages = append(ctx.Messages, Message{
+			context.Messages = append(context.Messages, Message{
 				Role:    "assistant",
 				Content: assistantText,
 			})
 
-			if err := saveJSON(contextPath, ctx); err != nil {
+			// TODO: Use append-only writes to survive crashes
+			if err := saveJSON(contextPath, context); err != nil {
 				return fmt.Errorf("saving context: %w", err)
 			}
 
@@ -323,20 +327,24 @@ func parseFlags() *options {
 	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
 		"max tokens for prompt")
 	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
-	flag.BoolVar(&opts.noTools, "no-tools", false, "disable tool use (chat only)")
-	flag.StringVar(&opts.outputFile, "o", "", "write output to file (default stdout)")
+	flag.BoolVar(&opts.noTools, "no-tools", false,
+		"disable tool use (chat only)")
+	flag.StringVar(&opts.outputFile, "o", "",
+		"write output to file (default stdout)")
 	flag.BoolVar(&opts.reset, "reset", false,
 		"reset conversation (delete .claude/ directory)")
 	var resumeDir2 string
 	flag.StringVar(&opts.resumeDir, "r", "",
 		"directory to resume/save conversation context")
 	flag.StringVar(&resumeDir2, "resume", "", "same as -r")
-	flag.BoolVar(&opts.showStats, "stats", false, "show conversation statistics")
+	flag.BoolVar(&opts.showStats, "stats", false,
+		"show conversation statistics")
 
 	flag.IntVar(&opts.timeout, "timeout", 30, "timeout in seconds")
 	flag.IntVar(&opts.truncate, "truncate", 0,
 		"keep only last N messages in context (0 = keep all)")
-	flag.StringVar(&opts.systemPrompt, "system", "", "custom system prompt")
+	flag.StringVar(&opts.systemPrompt, "system", "",
+		"custom system prompt")
 	flag.BoolVar(&opts.verbose, "verbose", false,
 		"verbose output (show context size, tokens, etc)")
 
@@ -350,12 +358,13 @@ func parseFlags() *options {
 }
 
 func listModels() error {
-	// TODO: Query API for models instead of hardcoding
-	fmt.Println("Supported Claude models:")
-	fmt.Println("  claude-opus-4-20250514")
-	fmt.Println("  claude-sonnet-4-5-20250929")
-	fmt.Println("  claude-sonnet-4-20250514")
-	fmt.Println("  claude-haiku-4-5-20251001")
+	// TODO: Query https://docs.anthropic.com/en/docs/about-claude/models
+	// for dynamic model list instead of hardcoding
+	fmt.Fprintln(os.Stderr, "Supported Claude models:")
+	fmt.Fprintln(os.Stderr, "  claude-opus-4-20250514")
+	fmt.Fprintln(os.Stderr, "  claude-sonnet-4-5-20250929")
+	fmt.Fprintln(os.Stderr, "  claude-sonnet-4-20250514")
+	fmt.Fprintln(os.Stderr, "  claude-haiku-4-5-20251001")
 	return nil
 }
 
@@ -364,15 +373,17 @@ func showStats(claudeDir string) error {
 	hist, _ := loadHistory(filepath.Join(claudeDir, "history.json"))
 	ctx, _ := loadContext(filepath.Join(claudeDir, "context.json"))
 
-	fmt.Printf("Project: %s\n", claudeDir)
-	fmt.Printf("Model: %s\n", cfg.Model)
-	fmt.Printf("Total tokens: %d in, %d out\n", cfg.TotalInput, cfg.TotalOutput)
-	fmt.Printf("Approximate cost: $%.4f\n",
-		float64(cfg.TotalInput)*3.0/1000000+float64(cfg.TotalOutput)*15.0/1000000)
-	fmt.Printf("History: %d messages\n", len(hist.Messages))
-	fmt.Printf("Context: %d messages\n", len(ctx.Messages))
-	fmt.Printf("Created: %s\n", cfg.CreatedAt)
-	fmt.Printf("Updated: %s\n", cfg.UpdatedAt)
+	fmt.Fprintf(os.Stderr, "Project: %s\n", claudeDir)
+	fmt.Fprintf(os.Stderr, "Model: %s\n", cfg.Model)
+	fmt.Fprintf(os.Stderr, "Total tokens: %d in, %d out\n",
+		cfg.TotalInput, cfg.TotalOutput)
+	fmt.Fprintf(os.Stderr, "Approximate cost: $%.4f\n",
+		float64(cfg.TotalInput)*3.0/1000000+
+			float64(cfg.TotalOutput)*15.0/1000000)
+	fmt.Fprintf(os.Stderr, "History: %d messages\n", len(hist.Messages))
+	fmt.Fprintf(os.Stderr, "Context: %d messages\n", len(ctx.Messages))
+	fmt.Fprintf(os.Stderr, "Created: %s\n", cfg.CreatedAt)
+	fmt.Fprintf(os.Stderr, "Updated: %s\n", cfg.UpdatedAt)
 
 	return nil
 }
@@ -425,7 +436,9 @@ func readInput() (string, error) {
 	return msg, nil
 }
 
-func callAPI(client *http.Client, apiKey string, model string, maxTokens int, system string, messages []MessageContent, opts *options) (*APIResponse, []byte, error) {
+func callAPI(client *http.Client, apiKey, model string, maxTokens int,
+	system string, messages []MessageContent, opts *options,
+) (*APIResponse, []byte, error) {
 	apiReq := APIRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
@@ -440,9 +453,10 @@ func callAPI(client *http.Client, apiKey string, model string, maxTokens int, sy
 	}
 
 	if opts.debug {
-		fmt.Println("=== request ===")
+		fmt.Fprintln(os.Stderr, "=== request ===")
 		spew.Dump(reqBody)
 	}
+
 	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating request: %w", err)
@@ -454,10 +468,7 @@ func callAPI(client *http.Client, apiKey string, model string, maxTokens int, sy
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"making API call: %w",
-			err,
-		)
+		return nil, nil, fmt.Errorf("making API call: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -472,11 +483,12 @@ func callAPI(client *http.Client, apiKey string, model string, maxTokens int, sy
 
 	var apiResp APIResponse
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, nil, fmt.Errorf("parsing response: %w\nBody: %s", err,
-			string(respBody))
+		return nil, nil, fmt.Errorf("parsing response: %w\nBody: %s",
+			err, respBody)
 	}
+
 	if opts.debug {
-		fmt.Println("=== response ===")
+		fmt.Fprintln(os.Stderr, "=== response ===")
 		spew.Dump(respBody)
 	}
 
@@ -484,41 +496,50 @@ func callAPI(client *http.Client, apiKey string, model string, maxTokens int, sy
 }
 
 func checkHTTPStatus(status int, body []byte) error {
+	// Try to parse Claude API error first (has more detail)
+	var apiErr struct {
+		Error *APIError `json:"error"`
+	}
+	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error != nil {
+		return fmt.Errorf("API error [%s]: %s",
+			apiErr.Error.Type, apiErr.Error.Message)
+	}
+
+	// Standard HTTP status codes
 	switch status {
 	case http.StatusOK:
 		return nil
 	case http.StatusBadRequest:
-		return fmt.Errorf("bad request (400): %s", string(body))
+		return fmt.Errorf("%s: %s", http.StatusText(status), body)
 	case http.StatusUnauthorized:
-		return fmt.Errorf(
-			"unauthorized (401): check API key")
+		return fmt.Errorf("%s: check API key", http.StatusText(status))
 	case http.StatusForbidden:
-		return fmt.Errorf("forbidden (403): %s", string(body))
+		return fmt.Errorf("%s: %s", http.StatusText(status), body)
 	case http.StatusNotFound:
-		return fmt.Errorf("not found (404): invalid endpoint")
+		return fmt.Errorf("%s: invalid endpoint", http.StatusText(status))
 	case http.StatusTooManyRequests:
-		return fmt.Errorf("rate limited (429): %s", string(body))
+		return fmt.Errorf("%s: %s", http.StatusText(status), body)
 	case http.StatusInternalServerError:
-		return fmt.Errorf("server error (500): %s", string(body))
+		return fmt.Errorf("%s: %s", http.StatusText(status), body)
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("service unavailable (503): %s", string(body))
+		return fmt.Errorf("%s: %s", http.StatusText(status), body)
+	case 529: // Anthropic-specific: overloaded
+		return fmt.Errorf("service overloaded (529): %s", body)
 	default:
-		return fmt.Errorf("unexpected status %d: %s", status, string(body))
+		return fmt.Errorf("HTTP %d: %s", status, body)
 	}
 }
 
 func extractResponse(apiResp *APIResponse) string {
-	if len(apiResp.Content) > 0 {
-		return apiResp.Content[0].Text
+	for _, content := range apiResp.Content {
+		if content.Type == "text" {
+			return content.Text
+		}
 	}
 	return ""
 }
 
-func appendHistory(
-	path string,
-	userMsg string,
-	assistantMsg string,
-) error {
+func appendHistory(path, userMsg, assistantMsg string) error {
 	hist, err := loadHistory(path)
 	if err != nil {
 		return err
@@ -529,10 +550,13 @@ func appendHistory(
 		Message{Role: "assistant", Content: assistantMsg},
 	)
 
+	// TODO: Use append-only writes to survive crashes
 	return saveJSON(path, hist)
 }
 
-func writeOutput(outputFile string, jsonOutput bool, assistantText string, respBody []byte) error {
+func writeOutput(outputFile string, jsonOutput bool,
+	assistantText string, respBody []byte,
+) error {
 	var output string
 	if jsonOutput {
 		output = string(respBody)
@@ -571,20 +595,20 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func loadContext(path string) (*Context, error) {
-	ctx := &Context{Messages: []Message{}}
+	context := &Context{Messages: []Message{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return ctx, nil
+			return context, nil
 		}
 		return nil, fmt.Errorf("reading context: %w", err)
 	}
 
-	if err := json.Unmarshal(data, ctx); err != nil {
+	if err := json.Unmarshal(data, context); err != nil {
 		return nil, fmt.Errorf("parsing context: %w", err)
 	}
 
-	return ctx, nil
+	return context, nil
 }
 
 func loadHistory(path string) (*History, error) {
@@ -674,7 +698,9 @@ func getTools(opts *options) []Tool {
 	}}
 }
 
-func executeTool(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+func executeTool(toolUse ContentBlock, workingDir string,
+	opts *options,
+) (ContentBlock, error) {
 	switch toolUse.Name {
 	case "read_file":
 		return executeReadFile(toolUse, workingDir, opts)
@@ -685,7 +711,9 @@ func executeTool(toolUse ContentBlock, workingDir string, opts *options) (Conten
 	}
 }
 
-func executeReadFile(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+func executeReadFile(toolUse ContentBlock, workingDir string,
+	opts *options,
+) (ContentBlock, error) {
 	path, ok := toolUse.Input["path"].(string)
 	if !ok {
 		return makeToolError(toolUse.ID, "path must be a string")
@@ -712,7 +740,9 @@ func executeReadFile(toolUse ContentBlock, workingDir string, opts *options) (Co
 	}, nil
 }
 
-func executeWriteFile(toolUse ContentBlock, workingDir string, opts *options) (ContentBlock, error) {
+func executeWriteFile(toolUse ContentBlock, workingDir string,
+	opts *options,
+) (ContentBlock, error) {
 	path, ok := toolUse.Input["path"].(string)
 	if !ok {
 		return makeToolError(toolUse.ID, "path must be a string")
@@ -734,11 +764,11 @@ func executeWriteFile(toolUse ContentBlock, workingDir string, opts *options) (C
 	showDiff(string(old), content)
 
 	if !opts.execute {
-		fmt.Fprintf(os.Stderr, "(dry-run: use -execute to apply)\n\n")
+		fmt.Fprintf(os.Stderr, "(dry-run: use --execute to apply)\n\n")
 		return ContentBlock{
 			Type:      "tool_result",
 			ToolUseID: toolUse.ID,
-			Content:   "Dry-run: changes not applied. Use -execute flag.",
+			Content:   "Dry-run: changes not applied. Use --execute flag.",
 		}, nil
 	}
 
@@ -766,8 +796,8 @@ func isSafePath(path, workingDir string) bool {
 }
 
 func showDiff(old, new string) {
+	// TODO: Use proper unified diff library
 	fmt.Fprintf(os.Stderr, "--- old\n+++ new\n")
-	// Simple line-by-line diff (could use proper diff lib later)
 	fmt.Fprintf(os.Stderr, "%s\n", new)
 }
 
