@@ -18,6 +18,7 @@ const (
 	defaultModel        = "claude-sonnet-4-5-20250929"
 	apiURL              = "https://api.anthropic.com/v1/messages"
 	apiVersion          = "2023-06-01"
+	maxContextTokens    = 100000 // Safe limit, ~75k tokens
 	defaultSystemPrompt = `You are a helpful coding assistant. Always wrap:
 - Filenames in backticks with language: ` + "```go filename.go```" + `
 - Code blocks in triple backticks with language specified
@@ -85,10 +86,12 @@ type options struct {
 	maxTokens    int
 	model        string
 	outputFile   string
+	reset        bool
 	resumeDir    string
 	showStats    bool
 	timeout      int
 	systemPrompt string
+	truncate     int
 	verbose      bool
 }
 
@@ -112,6 +115,11 @@ func run() error {
 	}
 	if opts.showStats {
 		return showStats(claudeDir)
+	}
+
+	// Nuke claude dir.
+	if opts.reset {
+		return resetConversation(claudeDir, opts.verbose)
 	}
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
@@ -152,6 +160,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if opts.truncate > 0 && len(ctx.Messages) > opts.truncate {
+		if opts.verbose {
+			fmt.Fprintf(os.Stderr, "Truncating context: %d → %d messages\n",
+				len(ctx.Messages), opts.truncate)
+		}
+		ctx.Messages = ctx.Messages[len(ctx.Messages)-opts.truncate:]
+	}
 	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "Loaded %d messages from context\n", len(ctx.Messages))
 	}
@@ -160,6 +175,17 @@ func run() error {
 		Role:    "user",
 		Content: userMsg,
 	})
+
+	estimatedTokens := estimateTokens(ctx.Messages)
+	if estimatedTokens > maxContextTokens {
+		return fmt.Errorf(
+			"context too large (%d tokens, max %d)\n"+
+				"Options:\n"+
+				"  claude -reset           # start fresh conversation\n"+
+				"  claude -truncate N      # keep last N messages\n"+
+				"  (auto-summarize coming later)",
+			estimatedTokens, maxContextTokens)
+	}
 
 	client := &http.Client{
 		Timeout: time.Duration(opts.timeout) * time.Second,
@@ -231,7 +257,8 @@ func parseFlags() *options {
 		"max tokens for prompt")
 	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
 	flag.StringVar(&opts.outputFile, "o", "", "write output to file (default stdout)")
-
+	flag.BoolVar(&opts.reset, "reset", false,
+		"reset conversation (delete .claude/ directory)")
 	var resumeDir2 string
 	flag.StringVar(&opts.resumeDir, "r", "",
 		"directory to resume/save conversation context")
@@ -239,6 +266,8 @@ func parseFlags() *options {
 	flag.BoolVar(&opts.showStats, "stats", false, "show conversation statistics")
 
 	flag.IntVar(&opts.timeout, "timeout", 30, "timeout in seconds")
+	flag.IntVar(&opts.truncate, "truncate", 0,
+		"keep only last N messages in context (0 = keep all)")
 	flag.StringVar(&opts.systemPrompt, "system", "", "custom system prompt")
 	flag.BoolVar(&opts.verbose, "verbose", false,
 		"verbose output (show context size, tokens, etc)")
@@ -517,4 +546,23 @@ func saveJSON(path string, v interface{}) error {
 	}
 
 	return nil
+}
+
+func resetConversation(claudeDir string, verbose bool) error {
+	if err := os.RemoveAll(claudeDir); err != nil {
+		return fmt.Errorf("removing %s: %w", claudeDir, err)
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "Reset: removed %s\n", claudeDir)
+	}
+	return nil
+}
+
+func estimateTokens(messages []Message) int {
+	// Rough estimate: ~4 chars per token
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content) / 4
+	}
+	return total
 }
