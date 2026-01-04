@@ -860,7 +860,7 @@ func estimateTokens(messages []Message) int {
 }
 
 func getTools(opts *options) []Tool {
-	if opts.canUseTools() {
+	if !opts.canUseTools() {
 		return nil
 	}
 
