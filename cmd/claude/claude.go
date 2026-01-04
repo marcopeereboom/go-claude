@@ -29,6 +29,30 @@ const (
 - Code blocks in triple backticks with language specified
 - Shell commands in ` + "```bash```" + ` blocks
 This helps with automated extraction and saving.`
+
+	// Defaults
+	defaultMaxTokens = 1000
+	defaultTimeout   = 30
+
+	// Verbosity levels
+	verbositySilent  = "silent"
+	verbosityNormal  = "normal"
+	verbosityVerbose = "verbose"
+	verbosityDebug   = "debug"
+	defaultVerbosity = verbosityNormal
+
+	// Tool permissions
+	toolNone    = "none"
+	toolRead    = "read"
+	toolWrite   = "write"
+	toolCommand = "command"
+	toolAll     = "all"
+	defaultTool = "" // dry-run
+
+	// Output formats
+	outputText    = "text"
+	outputJSON    = "json"
+	defaultOutput = outputText
 )
 
 // API types
@@ -107,23 +131,62 @@ type Conversation struct {
 
 // CLI options
 type options struct {
-	debug         bool
-	execute       bool
-	jsonOutput    bool
-	listModels    bool
+	// Modes
+	listModels bool
+	reset      bool
+	showStats  bool
+	replay     bool
+
+	// Core
+	maxTokens     int
 	maxCost       float64
 	maxIterations int
-	maxTokens     int
 	model         string
-	noTools       bool
-	outputFile    string
-	reset         bool
-	resumeDir     string
-	showStats     bool
 	timeout       int
 	systemPrompt  string
 	truncate      int
-	verbose       bool
+	resumeDir     string
+	outputFile    string
+
+	// Behavior
+	verbosity string
+	tool      string
+	output    string
+}
+
+// Helper methods for options
+func (o *options) isVerbose() bool {
+	return o.verbosity == verbosityVerbose || o.verbosity == verbosityDebug
+}
+
+func (o *options) isDebug() bool {
+	return o.verbosity == verbosityDebug
+}
+
+func (o *options) isSilent() bool {
+	return o.verbosity == verbositySilent
+}
+
+func (o *options) canExecuteWrite() bool {
+	if o.tool == "" {
+		return false // dry-run
+	}
+	return strings.Contains(o.tool, toolWrite) || o.tool == toolAll
+}
+
+func (o *options) canExecuteCommand() bool {
+	if o.tool == "" {
+		return false // dry-run
+	}
+	return strings.Contains(o.tool, toolCommand) || o.tool == toolAll
+}
+
+func (o *options) canUseTools() bool {
+	return o.tool != toolNone
+}
+
+func (o *options) wantsJSON() bool {
+	return o.output == outputJSON
 }
 
 // session holds all state needed for a conversation execution.
@@ -171,7 +234,7 @@ func run() error {
 	}
 
 	if opts.reset {
-		return resetConversation(claudeDir, opts.verbose)
+		return resetConversation(claudeDir, opts.isVerbose())
 	}
 
 	// Initialize session
@@ -193,47 +256,64 @@ func run() error {
 func parseFlags() *options {
 	opts := &options{}
 
-	// TODO: add defaults everywhere and print them. Add a preamble and
-	// examples to help as well.
-	flag.BoolVar(&opts.debug, "debug", false, "debug output")
-	flag.BoolVar(&opts.execute, "execute", false,
-		"actually execute tool operations (default: dry-run)")
-	flag.BoolVar(&opts.jsonOutput, "json", false, "output raw JSON")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: claude [options]\n\n")
+		fmt.Fprintf(os.Stderr, "A CLI for interacting with Claude AI with tool support.\n\n")
+		fmt.Fprintf(os.Stderr, "Examples:\n")
+		fmt.Fprintf(os.Stderr, "  # Dry-run (shows what would happen)\n")
+		fmt.Fprintf(os.Stderr, "  echo \"add error handling to users.go\" | claude\n\n")
+		fmt.Fprintf(os.Stderr, "  # Execute with write permission\n")
+		fmt.Fprintf(os.Stderr, "  echo \"add tests\" | claude --tool=write\n\n")
+		fmt.Fprintf(os.Stderr, "  # Replay last run and execute everything\n")
+		fmt.Fprintf(os.Stderr, "  claude --replay --tool=all\n\n")
+		fmt.Fprintf(os.Stderr, "  # Show statistics\n")
+		fmt.Fprintf(os.Stderr, "  claude --stats\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
+
+	// Modes
 	flag.BoolVar(&opts.listModels, "list-models", false,
 		"list supported Claude models")
-	flag.Float64Var(&opts.maxCost, "max-cost", defaultMaxCost,
-		"max cost in dollars per conversation (0 = unlimited)")
-	flag.IntVar(&opts.maxIterations, "max-iterations", defaultMaxIterations,
-		"max tool loop iterations (0 = unlimited)")
-	flag.IntVar(&opts.maxTokens, "max-tokens", 1000,
-		"max tokens for prompt")
-	flag.StringVar(&opts.model, "model", "", "model id for single prompt")
-	flag.BoolVar(&opts.noTools, "no-tools", false,
-		"disable tool use (chat only)")
-	flag.StringVar(&opts.outputFile, "o", "",
-		"write output to file (default stdout)")
 	flag.BoolVar(&opts.reset, "reset", false,
 		"reset conversation (delete .claude/ directory)")
-	var resumeDir2 string
-	flag.StringVar(&opts.resumeDir, "r", "",
-		"directory to resume/save conversation context")
-	flag.StringVar(&resumeDir2, "resume", "", "same as -r")
 	flag.BoolVar(&opts.showStats, "stats", false,
 		"show conversation statistics")
 
-	flag.IntVar(&opts.timeout, "timeout", 30, "timeout in seconds")
+	flag.BoolVar(&opts.replay, "replay", false,
+		"replay last conversation's tool calls without calling API")
+
+	// Core settings
+	flag.StringVar(&opts.model, "model", "",
+		fmt.Sprintf("model to use (default: %s)", defaultModel))
+	flag.IntVar(&opts.maxTokens, "max-tokens", defaultMaxTokens,
+		"maximum tokens per API call")
+	flag.Float64Var(&opts.maxCost, "max-cost", defaultMaxCost,
+		"maximum cost in dollars per conversation (0 = unlimited)")
+	flag.IntVar(&opts.maxIterations, "max-iterations", defaultMaxIterations,
+		"maximum tool loop iterations (0 = unlimited)")
+	flag.IntVar(&opts.timeout, "timeout", defaultTimeout,
+		"HTTP timeout in seconds")
 	flag.IntVar(&opts.truncate, "truncate", 0,
-		"keep only last N messages in context (0 = keep all)")
+		"keep only last N messages in conversation (0 = keep all)")
+
+	// Behavior
+	flag.StringVar(&opts.verbosity, "verbosity", defaultVerbosity,
+		"output verbosity: silent, normal, verbose, debug")
+	flag.StringVar(&opts.tool, "tool", defaultTool,
+		"tool permissions: \"\" (dry-run), none, read, write, command, all, or comma-separated")
+	flag.StringVar(&opts.output, "output", defaultOutput,
+		"output format: text, json")
+
+	// Advanced
 	flag.StringVar(&opts.systemPrompt, "system", "",
 		"custom system prompt")
-	flag.BoolVar(&opts.verbose, "verbose", false,
-		"verbose output (show context size, tokens, etc)")
+	flag.StringVar(&opts.resumeDir, "resume-dir", "",
+		"directory for conversation state (default: current directory)")
+	flag.StringVar(&opts.outputFile, "output-file", "",
+		"write output to file instead of stdout")
 
 	flag.Parse()
-
-	if opts.resumeDir == "" {
-		opts.resumeDir = resumeDir2
-	}
 
 	return opts
 }
@@ -298,7 +378,7 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		return nil, err
 	}
 
-	if opts.verbose {
+	if opts.isVerbose() {
 		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
 		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
 	}
@@ -310,13 +390,13 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		return nil, err
 	}
 
-	if opts.verbose {
+	if opts.isVerbose() {
 		fmt.Fprintf(os.Stderr, "Loaded %d messages\n", len(convo.Messages))
 	}
 
 	// Handle truncation
 	if opts.truncate > 0 && len(convo.Messages) > opts.truncate {
-		if opts.verbose {
+		if opts.isVerbose() {
 			fmt.Fprintf(os.Stderr, "Truncating: %d → %d messages\n",
 				len(convo.Messages), opts.truncate)
 		}
@@ -381,7 +461,7 @@ func executeConversation(sess *session) (*conversationResult, error) {
 		}
 
 		if apiResp.Error != nil {
-			if sess.opts.jsonOutput {
+			if sess.opts.wantsJSON() {
 				fmt.Println(string(respBody))
 			}
 			return nil, fmt.Errorf("API error [%s]: %s",
@@ -404,7 +484,7 @@ func executeConversation(sess *session) (*conversationResult, error) {
 		sess.config.TotalInput += apiResp.Usage.InputTokens
 		sess.config.TotalOutput += apiResp.Usage.OutputTokens
 
-		if sess.opts.verbose {
+		if sess.opts.isVerbose() {
 			fmt.Fprintf(os.Stderr,
 				"Iteration %d - Tokens: %d in, %d out (cost: $%.4f)\n",
 				i+1, apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
@@ -502,7 +582,7 @@ func finalizeSession(sess *session, result *conversationResult) error {
 	// Output result
 	// TODO: add syntax highligted md and code blocks when printing to
 	// terminal. Do not write escape codes to any files ever.
-	return writeOutput(sess.opts.outputFile, sess.opts.jsonOutput,
+	return writeOutput(sess.opts.outputFile, sess.opts.wantsJSON(),
 		result.assistantText, result.respBody)
 }
 
@@ -570,7 +650,7 @@ func callAPI(client *http.Client, apiKey, model string, maxTokens int,
 		return nil, nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	if opts.debug {
+	if opts.isDebug() {
 		fmt.Fprintln(os.Stderr, "=== request ===")
 		spew.Dump(reqBody)
 	}
@@ -605,7 +685,7 @@ func callAPI(client *http.Client, apiKey, model string, maxTokens int,
 			err, respBody)
 	}
 
-	if opts.debug {
+	if opts.isDebug() {
 		fmt.Fprintln(os.Stderr, "=== response ===")
 		spew.Dump(respBody)
 	}
@@ -780,7 +860,7 @@ func estimateTokens(messages []Message) int {
 }
 
 func getTools(opts *options) []Tool {
-	if opts.noTools {
+	if opts.canUseTools() {
 		return nil
 	}
 
@@ -844,7 +924,7 @@ func executeReadFile(toolUse ContentBlock, workingDir string,
 			fmt.Sprintf("path outside project: %s", path))
 	}
 
-	if opts.verbose {
+	if opts.isVerbose() {
 		fmt.Fprintf(os.Stderr, "Tool: read_file(%s)\n", path)
 	}
 
@@ -883,7 +963,7 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 	fmt.Fprintf(os.Stderr, "\n=== %s ===\n", path)
 	showDiff(string(old), content)
 
-	if !opts.execute {
+	if !opts.canExecuteWrite() {
 		fmt.Fprintf(os.Stderr, "(dry-run: use --execute to apply)\n\n")
 		return ContentBlock{
 			Type:      "tool_result",
@@ -893,7 +973,7 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 		}, nil
 	}
 
-	if opts.verbose {
+	if opts.isVerbose() {
 		fmt.Fprintf(os.Stderr, "Tool: write_file(%s)\n", path)
 	}
 
