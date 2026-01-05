@@ -25,6 +25,19 @@ type Config struct {
 	LastRun      string `json:"last_run"`
 }
 
+// AuditLogEntry represents a single tool execution for audit trail
+type AuditLogEntry struct {
+	Timestamp      string                 `json:"timestamp"`
+	Tool           string                 `json:"tool"`
+	Input          map[string]interface{} `json:"input"`
+	Result         map[string]interface{} `json:"result"`
+	Success        bool                   `json:"success"`
+	DurationMs     int64                  `json:"duration_ms"`
+	ConversationID string                 `json:"conversation_id"`
+	DryRun         bool                   `json:"dry_run"`
+	Error          string                 `json:"error,omitempty"`
+}
+
 // saveRequest saves the request (conversation context + user message) to disk
 func saveRequest(claudeDir, timestamp string, messages []MessageContent) error {
 	req := Request{
@@ -225,7 +238,7 @@ func replayResponse(claudeDir string, opts *options) error {
 			if opts.isVerbose() {
 				fmt.Fprintf(os.Stderr, "Iteration %d: %s\n", respIdx, block.Name)
 			}
-			if _, err := executeTool(block, workingDir, opts); err != nil {
+			if _, err := executeTool(block, workingDir, opts, timestamp); err != nil {
 				return fmt.Errorf("tool %s failed: %w", block.Name, err)
 			}
 		}
@@ -235,4 +248,30 @@ func replayResponse(claudeDir string, opts *options) error {
 		fmt.Fprintf(os.Stderr, "Replayed %d tools\n", toolCount)
 	}
 	return nil
+}
+
+// appendAuditLog appends a tool execution entry to the audit log
+func appendAuditLog(entry AuditLogEntry) error {
+	claudeDir := ".claude"
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		return fmt.Errorf("ensure .claude dir: %w", err)
+	}
+
+	logPath := filepath.Join(claudeDir, "tool_log.jsonl")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open audit log: %w", err)
+	}
+	defer f.Close()
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshal audit entry: %w", err)
+	}
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write audit log: %w", err)
+	}
+
+	return f.Sync()
 }
