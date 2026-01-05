@@ -75,16 +75,19 @@ func loadConversationHistory(claudeDir string) ([]MessageContent, error) {
 			continue
 		}
 
-		var resp APIResponse
-		if err := json.Unmarshal(respData, &resp); err != nil {
+		var responses []APIResponse
+		if err := json.Unmarshal(respData, &responses); err != nil {
 			continue
 		}
 
-		// Add assistant response
-		messages = append(messages, MessageContent{
-			Role:    "assistant",
-			Content: resp.Content,
-		})
+		// Add assistant response (use last response, which has final text)
+		if len(responses) > 0 {
+			lastResp := responses[len(responses)-1]
+			messages = append(messages, MessageContent{
+				Role:    "assistant",
+				Content: lastResp.Content,
+			})
+		}
 	}
 
 	return messages, nil
