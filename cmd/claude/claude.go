@@ -785,12 +785,20 @@ func writeOutput(outputFile string, jsonOutput bool,
 
 	switch {
 	case outputFile != "":
+		// Never write escape codes to files
 		err := os.WriteFile(outputFile, []byte(output), 0o644)
 		if err != nil {
 			return fmt.Errorf("writing output file: %w", err)
 		}
 	default:
-		fmt.Println(output)
+		// Apply markdown formatting if TTY
+		if !jsonOutput && isTTY(os.Stdout) {
+			FormatMarkdown(os.Stdout, output)
+			fmt.Println() // trailing newline
+		} else {
+			fmt.Println(output)
+		}
+
 	}
 
 	return nil
@@ -989,8 +997,8 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 
 	old, _ := os.ReadFile(path)
 
-	fmt.Fprintf(os.Stderr, "\n=== %s ===\n", path)
-	showDiff(string(old), content)
+	ToolHeader(path, !opts.canExecuteWrite())
+	ShowDiff(string(old), content)
 
 	if !opts.canExecuteWrite() {
 		fmt.Fprintf(os.Stderr, "(dry-run: use --tool=write to apply)\n\n")
@@ -1062,8 +1070,8 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 			"Dry-run: would execute command: %s\nReason: %s\n"+
 				"Use --tool=command or --tool=all to execute",
 			command, reason)
-		fmt.Fprintf(os.Stderr, "\n=== bash_command (dry-run) ===\n%s\n\n",
-			msg)
+		ToolHeader("bash_command", true)
+		fmt.Fprintf(os.Stderr, "%s\n\n", msg)
 
 		logAuditEntry("bash_command", toolUse.Input, map[string]interface{}{
 			"dry_run": true,
@@ -1198,12 +1206,6 @@ func isSafePath(path, workingDir string) bool {
 		return false
 	}
 	return strings.HasPrefix(abs, workingDir)
-}
-
-func showDiff(old, new string) {
-	// TODO: Use proper unified diff library
-	fmt.Fprintf(os.Stderr, "--- old\n+++ new\n")
-	fmt.Fprintf(os.Stderr, "%s\n", new)
 }
 
 func makeToolError(toolUseID, errMsg string) (ContentBlock, error) {

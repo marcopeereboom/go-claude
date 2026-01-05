@@ -68,6 +68,12 @@ go run ./cmd/claude --stats
 
 ## Current State
 
+**When providing patches:**
+1. ALWAYS use `write_file` tool to write patch files to disk
+2. NEVER just display patches in markdown - user can't apply them
+3. Patch filename format: `NNNN-description.patch` (e.g., `0001-add-feature.patch`)
+4. User applies with: `git apply <patchfile>` or `patch -p1 < <patchfile>`
+
 ### What Works
 - Basic tool execution (read_file, write_file)
 - Request/response saving as file pairs
