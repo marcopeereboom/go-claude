@@ -997,8 +997,11 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 
 	old, _ := os.ReadFile(path)
 
-	ToolHeader(path, !opts.canExecuteWrite())
-	ShowDiff(string(old), content)
+	// Only show diff in normal/verbose mode
+	if !opts.isSilent() {
+		ToolHeader(path, !opts.canExecuteWrite())
+		ShowDiff(string(old), content)
+	}
 
 	if !opts.canExecuteWrite() {
 		fmt.Fprintf(os.Stderr, "(dry-run: use --tool=write to apply)\n\n")
@@ -1070,7 +1073,9 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 			"Dry-run: would execute command: %s\nReason: %s\n"+
 				"Use --tool=command or --tool=all to execute",
 			command, reason)
-		ToolHeader("bash_command", true)
+		if !opts.isSilent() {
+			ToolHeader("bash_command", true)
+		}
 		fmt.Fprintf(os.Stderr, "%s\n\n", msg)
 
 		logAuditEntry("bash_command", toolUse.Input, map[string]interface{}{
