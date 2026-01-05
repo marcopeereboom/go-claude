@@ -19,7 +19,6 @@ import (
 
 const (
 	defaultModel         = "claude-sonnet-4-5-20250929"
-	apiURL               = "https://api.anthropic.com/v1/messages"
 	apiVersion           = "2023-06-01"
 	maxContextTokens     = 100000
 	defaultMaxIterations = 15
@@ -54,6 +53,9 @@ This helps with automated extraction and saving.`
 	outputJSON    = "json"
 	defaultOutput = outputText
 )
+
+// apiURL can be overridden in tests
+var apiURL = "https://api.anthropic.com/v1/messages"
 
 // API types
 type APIRequest struct {
