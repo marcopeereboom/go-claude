@@ -214,7 +214,7 @@ See [docs/development-workflow.md](docs/development-workflow.md) for details.
 
 ## License
 
-[License TBD]
+MIT see [LICENSE](LICENSE)
 
 ## Contributing
 
