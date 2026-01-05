@@ -31,7 +31,7 @@ This helps with automated extraction and saving.`
 
 	// Defaults
 	defaultMaxTokens = 1000
-	defaultTimeout   = 30
+	defaultTimeout   = 300
 
 	// Verbosity levels
 	verbositySilent  = "silent"
