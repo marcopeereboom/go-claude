@@ -106,36 +106,14 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// Storage types
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type Config struct {
-	Model        string `json:"model"`
-	SystemPrompt string `json:"system_prompt,omitempty"`
-	TotalInput   int    `json:"total_input_tokens"`
-	TotalOutput  int    `json:"total_output_tokens"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
-}
-
-type History struct {
-	Messages []Message `json:"messages"`
-}
-
-type Conversation struct {
-	Messages []Message `json:"messages"`
-}
-
 // CLI options
 type options struct {
 	// Modes
 	listModels bool
 	reset      bool
 	showStats  bool
-	replay     bool
+	replay     string
+	pruneOld   int
 
 	// Core
 	maxTokens     int
@@ -198,7 +176,7 @@ type session struct {
 	model      string
 	sysPrompt  string
 	userMsg    string
-	convo      *Conversation
+	timestamp  string
 	workingDir string
 	client     *http.Client
 }
@@ -237,6 +215,14 @@ func run() error {
 		return resetConversation(claudeDir, opts.isVerbose())
 	}
 
+	if opts.replay != "NOREPLAY" {
+		return replayResponse(claudeDir, opts)
+	}
+
+	if opts.pruneOld > 0 {
+		return pruneResponses(claudeDir, opts.pruneOld, opts.isVerbose())
+	}
+
 	// Initialize session
 	sess, err := initSession(opts, claudeDir)
 	if err != nil {
@@ -265,7 +251,8 @@ func parseFlags() *options {
 		fmt.Fprintf(os.Stderr, "  # Execute with write permission\n")
 		fmt.Fprintf(os.Stderr, "  echo \"add tests\" | claude --tool=write\n\n")
 		fmt.Fprintf(os.Stderr, "  # Replay last run and execute everything\n")
-		fmt.Fprintf(os.Stderr, "  claude --replay --tool=all\n\n")
+		fmt.Fprintf(os.Stderr, "  claude --replay --tool=all\n")
+		fmt.Fprintf(os.Stderr, "  claude --replay=20260104_153022 --tool=all\n\n")
 		fmt.Fprintf(os.Stderr, "  # Show statistics\n")
 		fmt.Fprintf(os.Stderr, "  claude --stats\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
@@ -280,8 +267,10 @@ func parseFlags() *options {
 	flag.BoolVar(&opts.showStats, "stats", false,
 		"show conversation statistics")
 
-	flag.BoolVar(&opts.replay, "replay", false,
-		"replay last conversation's tool calls without calling API")
+	flag.StringVar(&opts.replay, "replay", "NOREPLAY",
+		"replay response (empty=latest, or timestamp like 20260104_153022)")
+	flag.IntVar(&opts.pruneOld, "prune-old", 0,
+		"keep only last N request/response pairs, delete older")
 
 	// Core settings
 	flag.StringVar(&opts.model, "model", "",
@@ -330,9 +319,12 @@ func listModels() error {
 }
 
 func showStats(claudeDir string) error {
-	cfg, _ := loadConfig(filepath.Join(claudeDir, "config.json"))
-	hist, _ := loadHistory(filepath.Join(claudeDir, "history.json"))
-	convo, _ := loadConversation(filepath.Join(claudeDir, "conversation.json"))
+	cfg := loadOrCreateConfig(filepath.Join(claudeDir, "config.json"))
+
+	pairs, err := listRequestResponsePairs(claudeDir)
+	if err != nil {
+		return err
+	}
 
 	fmt.Fprintf(os.Stderr, "Project: %s\n", claudeDir)
 	fmt.Fprintf(os.Stderr, "Model: %s\n", cfg.Model)
@@ -341,10 +333,9 @@ func showStats(claudeDir string) error {
 	fmt.Fprintf(os.Stderr, "Approximate cost: $%.4f\n",
 		float64(cfg.TotalInput)*3.0/1000000+
 			float64(cfg.TotalOutput)*15.0/1000000)
-	fmt.Fprintf(os.Stderr, "History: %d messages\n", len(hist.Messages))
-	fmt.Fprintf(os.Stderr, "Conversation: %d messages\n", len(convo.Messages))
-	fmt.Fprintf(os.Stderr, "Created: %s\n", cfg.CreatedAt)
-	fmt.Fprintf(os.Stderr, "Updated: %s\n", cfg.UpdatedAt)
+	fmt.Fprintf(os.Stderr, "Conversation turns: %d\n", len(pairs))
+	fmt.Fprintf(os.Stderr, "First run: %s\n", cfg.FirstRun)
+	fmt.Fprintf(os.Stderr, "Last run: %s\n", cfg.LastRun)
 
 	return nil
 }
@@ -362,15 +353,15 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 
 	// Load configuration
 	configPath := filepath.Join(claudeDir, "config.json")
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return nil, err
-	}
+	cfg := loadOrCreateConfig(configPath)
 
 	selectedModel := selectModel(opts.model, cfg.Model)
 	cfg.Model = selectedModel
 
 	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
+	cfg.SystemPrompt = sysPrompt
+
+	timestamp := time.Now().Format("20060102_150405")
 
 	// Read user input
 	userMsg, err := readInput()
@@ -383,34 +374,27 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
 	}
 
-	// Load and prepare conversation
-	convoPath := filepath.Join(claudeDir, "conversation.json")
-	convo, err := loadConversation(convoPath)
+	// Load conversation history from request/response pairs
+	messages, err := loadConversationHistory(claudeDir)
 	if err != nil {
 		return nil, err
 	}
 
 	if opts.isVerbose() {
-		fmt.Fprintf(os.Stderr, "Loaded %d messages\n", len(convo.Messages))
+		fmt.Fprintf(os.Stderr, "Loaded %d messages\n", len(messages))
 	}
 
 	// Handle truncation
-	if opts.truncate > 0 && len(convo.Messages) > opts.truncate {
+	if opts.truncate > 0 && len(messages) > opts.truncate {
 		if opts.isVerbose() {
 			fmt.Fprintf(os.Stderr, "Truncating: %d → %d messages\n",
-				len(convo.Messages), opts.truncate)
+				len(messages), opts.truncate)
 		}
-		convo.Messages = convo.Messages[len(convo.Messages)-opts.truncate:]
+		messages = messages[len(messages)-opts.truncate:]
 	}
 
-	// Add user message
-	convo.Messages = append(convo.Messages, Message{
-		Role:    "user",
-		Content: userMsg,
-	})
-
-	// Check context size
-	estimatedTokens := estimateTokens(convo.Messages)
+	// Check context size (will add user message in executeConversation)
+	estimatedTokens := estimateTokens(messages)
 	if estimatedTokens > maxContextTokens {
 		return nil, fmt.Errorf(
 			"conversation too large (%d tokens, max %d)\n"+
@@ -433,7 +417,7 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		model:      selectedModel,
 		sysPrompt:  sysPrompt,
 		userMsg:    userMsg,
-		convo:      convo,
+		timestamp:  timestamp,
 		workingDir: workingDir,
 		client: &http.Client{
 			Timeout: time.Duration(opts.timeout) * time.Second,
@@ -443,7 +427,27 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 
 // executeConversation runs the agentic loop with tool support.
 func executeConversation(sess *session) (*conversationResult, error) {
-	messages := convertToMessageContent(sess.convo.Messages)
+	// Load conversation history
+	messages, err := loadConversationHistory(sess.claudeDir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add current user message
+	messages = append(messages, MessageContent{
+		Role: "user",
+		Content: []ContentBlock{{
+			Type: "text",
+			Text: sess.userMsg,
+		}},
+	})
+
+	// Save request before calling API
+	if err := saveRequest(sess.claudeDir, sess.timestamp, messages); err != nil {
+		return nil, fmt.Errorf("saving request: %w", err)
+	}
+
+	var responses []json.RawMessage
 	iterationCost := 0.0
 
 	maxIter := sess.opts.maxIterations
@@ -497,15 +501,24 @@ func executeConversation(sess *session) (*conversationResult, error) {
 			Content: apiResp.Content,
 		})
 
+		// Collect all responses
+		responses = append(responses, json.RawMessage(respBody))
+
 		// Handle different stop reasons
 		switch apiResp.StopReason {
 		case "end_turn":
-			// Conversation complete
+			// Conversation complete - save response
 			assistantText := extractResponse(apiResp)
-			sess.convo.Messages = append(sess.convo.Messages, Message{
-				Role:    "assistant",
-				Content: assistantText,
-			})
+
+			// Save all responses as array
+			responsesJSON, err := json.MarshalIndent(responses, "", "\t")
+			if err != nil {
+				return nil, fmt.Errorf("marshaling responses: %w", err)
+			}
+			if err := saveResponse(sess.claudeDir, sess.timestamp, responsesJSON); err != nil {
+				return nil, fmt.Errorf("saving responses: %w", err)
+			}
+
 			return &conversationResult{
 				assistantText: assistantText,
 				respBody:      respBody,
@@ -554,23 +567,9 @@ func executeTools(content []ContentBlock, workingDir string,
 // finalizeSession saves all state and outputs the result.
 func finalizeSession(sess *session, result *conversationResult) error {
 	// Update timestamps
-	sess.config.UpdatedAt = time.Now().Format(time.RFC3339)
-	if sess.config.CreatedAt == "" {
-		sess.config.CreatedAt = sess.config.UpdatedAt
-	}
-
-	// Save conversation
-	// TODO: Use append-only writes to survive crashes
-	convoPath := filepath.Join(sess.claudeDir, "conversation.json")
-	if err := saveJSON(convoPath, sess.convo); err != nil {
-		return fmt.Errorf("saving conversation: %w", err)
-	}
-
-	// Save history
-	historyPath := filepath.Join(sess.claudeDir, "history.json")
-	if err := appendHistory(historyPath, sess.userMsg,
-		result.assistantText); err != nil {
-		return fmt.Errorf("saving history: %w", err)
+	sess.config.LastRun = sess.timestamp
+	if sess.config.FirstRun == "" {
+		sess.config.FirstRun = sess.timestamp
 	}
 
 	// Save config
@@ -738,21 +737,6 @@ func extractResponse(apiResp *APIResponse) string {
 	return ""
 }
 
-func appendHistory(path, userMsg, assistantMsg string) error {
-	hist, err := loadHistory(path)
-	if err != nil {
-		return err
-	}
-
-	hist.Messages = append(hist.Messages,
-		Message{Role: "user", Content: userMsg},
-		Message{Role: "assistant", Content: assistantMsg},
-	)
-
-	// TODO: Use append-only writes to survive crashes
-	return saveJSON(path, hist)
-}
-
 func writeOutput(outputFile string, jsonOutput bool,
 	assistantText string, respBody []byte,
 ) error {
@@ -774,57 +758,6 @@ func writeOutput(outputFile string, jsonOutput bool,
 	}
 
 	return nil
-}
-
-func loadConfig(path string) (*Config, error) {
-	cfg := &Config{}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil
-		}
-		return nil, fmt.Errorf("reading config: %w", err)
-	}
-
-	if err := json.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
-	}
-
-	return cfg, nil
-}
-
-func loadConversation(path string) (*Conversation, error) {
-	convo := &Conversation{Messages: []Message{}}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return convo, nil
-		}
-		return nil, fmt.Errorf("reading conversation: %w", err)
-	}
-
-	if err := json.Unmarshal(data, convo); err != nil {
-		return nil, fmt.Errorf("parsing conversation: %w", err)
-	}
-
-	return convo, nil
-}
-
-func loadHistory(path string) (*History, error) {
-	hist := &History{Messages: []Message{}}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return hist, nil
-		}
-		return nil, fmt.Errorf("reading history: %w", err)
-	}
-
-	if err := json.Unmarshal(data, hist); err != nil {
-		return nil, fmt.Errorf("parsing history: %w", err)
-	}
-
-	return hist, nil
 }
 
 func saveJSON(path string, v interface{}) error {
@@ -850,11 +783,15 @@ func resetConversation(claudeDir string, verbose bool) error {
 	return nil
 }
 
-func estimateTokens(messages []Message) int {
+func estimateTokens(messages []MessageContent) int {
 	// Rough estimate: ~4 chars per token
 	total := 0
 	for _, msg := range messages {
-		total += len(msg.Content) / 4
+		for _, block := range msg.Content {
+			if block.Type == "text" {
+				total += len(block.Text) / 4
+			}
+		}
 	}
 	return total
 }
@@ -964,12 +901,12 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 	showDiff(string(old), content)
 
 	if !opts.canExecuteWrite() {
-		fmt.Fprintf(os.Stderr, "(dry-run: use --execute to apply)\n\n")
+		fmt.Fprintf(os.Stderr, "(dry-run: use --tool=write to apply)\n\n")
 		return ContentBlock{
 			Type:      "tool_result",
 			ToolUseID: toolUse.ID,
 			Content: "Dry-run: changes not applied. " +
-				"Use --execute flag.",
+				"Use --tool=write flag.",
 		}, nil
 	}
 
@@ -1008,17 +945,4 @@ func makeToolError(toolUseID, errMsg string) (ContentBlock, error) {
 		ToolUseID: toolUseID,
 		Content:   fmt.Sprintf("Error: %s", errMsg),
 	}, nil
-}
-
-func convertToMessageContent(messages []Message) []MessageContent {
-	result := make([]MessageContent, len(messages))
-	for i, msg := range messages {
-		result[i] = MessageContent{
-			Role: msg.Role,
-			Content: []ContentBlock{
-				{Type: "text", Text: msg.Content},
-			},
-		}
-	}
-	return result
 }
