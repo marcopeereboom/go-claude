@@ -195,9 +195,11 @@ go run ./cmd/claude --stats
 - Descriptive variable names
 - Comments explain WHY, not WHAT
 - Unix philosophy: do one thing well
-- Test drive development
 
 ## Development Workflow
+
+- Test driven development
+- prefer patches that can be applied instead of token burning whole files.
 
 Going forward, use go-claude itself for development:
 ```bash
