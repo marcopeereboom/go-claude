@@ -1206,12 +1206,20 @@ func validateCommand(command string) error {
 	return nil
 }
 
+// isSafePath checks if path is within workingDir
+// Returns false if path escapes workingDir through .. or symlinks
 func isSafePath(path, workingDir string) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false
 	}
-	return strings.HasPrefix(abs, workingDir)
+	
+	// Clean both paths and ensure workingDir has trailing separator
+	// to prevent "/home/user/project" matching "/home/user/project-evil"
+	cleanWorking := filepath.Clean(workingDir) + string(filepath.Separator)
+	cleanAbs := filepath.Clean(abs) + string(filepath.Separator)
+	
+	return strings.HasPrefix(cleanAbs, cleanWorking)
 }
 
 func makeToolError(toolUseID, errMsg string) (ContentBlock, error) {
