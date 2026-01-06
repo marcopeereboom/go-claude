@@ -132,11 +132,14 @@ type Usage struct {
 // CLI options
 type options struct {
 	// Modes
-	listModels bool
-	reset      bool
-	showStats  bool
-	replay     string
-	pruneOld   int
+	listModels  bool
+	reset       bool
+	showStats   bool
+	replay      string
+	pruneOld    int
+	estimate    bool
+	execute     bool
+	maxCostFlag float64
 
 	// Core
 	maxTokens     int
@@ -198,7 +201,6 @@ type session struct {
 	config     *Config
 	model      string
 	sysPrompt  string
-	userMsg    string
 	timestamp  string
 	workingDir string
 	client     *http.Client
@@ -220,14 +222,111 @@ func main() {
 func run() error {
 	opts := parseFlags()
 
-	// Handle special modes that don't need full setup
-	if opts.listModels {
-		return listModels()
-	}
-
 	claudeDir, err := getClaudeDir(opts.resumeDir)
 	if err != nil {
 		return err
+	}
+
+	// Handle --execute mode (use last message from conversation)
+	if opts.execute {
+		messages, err := loadConversationHistory(claudeDir)
+		if err != nil {
+			return fmt.Errorf("loading conversation: %w", err)
+		}
+
+		var userMsg string
+
+		// Try to get last user message from completed conversation
+		if len(messages) > 0 {
+			userMsg, err = getLastUserMessage(messages)
+			if err != nil {
+				return fmt.Errorf("no user message in conversation")
+			}
+		} else {
+			// No complete pairs - check for unpaired request (from --estimate)
+			entries, err := os.ReadDir(claudeDir)
+			if err != nil {
+				return fmt.Errorf("no conversation history")
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "request_") {
+					reqPath := filepath.Join(claudeDir, entry.Name())
+					var req Request
+					data, _ := os.ReadFile(reqPath)
+					json.Unmarshal(data, &req)
+					userMsg, _ = getLastUserMessage(req.Messages)
+					break
+				}
+			}
+			if userMsg == "" {
+				return fmt.Errorf("no message to execute")
+			}
+		}
+
+		// Override max-cost if provided
+		if opts.maxCostFlag > 0 {
+			opts.maxCost = opts.maxCostFlag
+		}
+
+		// Normal execution flow with last user message
+		return executeWithSavedInput(userMsg, opts, claudeDir)
+	}
+
+	// Handle --estimate mode
+	if opts.estimate {
+		// Must have stdin
+		stat, _ := os.Stdin.Stat()
+		if (stat.Mode() & os.ModeCharDevice) != 0 {
+			return fmt.Errorf("no input (pipe required)")
+		}
+
+		userMsg, err := readInput()
+		if err != nil {
+			return err
+		}
+
+		// Load conversation history
+		messages, _ := loadConversationHistory(claudeDir)
+
+		// Get model for pricing
+		configPath := filepath.Join(claudeDir, "config.json")
+		cfg := loadOrCreateConfig(configPath)
+		model := selectModel(opts.model, cfg.Model)
+
+		// Estimate and display
+		estimate := estimateCost(userMsg, messages, model)
+		displayEstimate(estimate)
+
+		// Save this message to conversation so --execute can use it
+		timestamp := time.Now().Format("20060102_150405")
+		messages = append(messages, MessageContent{
+			Role: "user",
+			Content: []ContentBlock{{
+				Type: "text",
+				Text: userMsg,
+			}},
+		})
+		if err := saveRequest(claudeDir, timestamp, messages); err != nil {
+			return fmt.Errorf("saving request: %w", err)
+		}
+
+		// Update config
+		cfg.Model = model
+		cfg.LastRun = timestamp
+		if cfg.FirstRun == "" {
+			cfg.FirstRun = timestamp
+		}
+		configPath = filepath.Join(claudeDir, "config.json")
+		if err := saveJSON(configPath, cfg); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+
+		return nil
+	}
+
+	// Handle special modes that don't need full setup
+	if opts.listModels {
+		return listModels()
 	}
 
 	if opts.showStats {
@@ -257,6 +356,15 @@ func run() error {
 		return fmt.Errorf("no input provided (pipe or redirect required)")
 	}
 
+	// Normal execution
+	userMsg, err := readInput()
+	if err != nil {
+		return err
+	}
+	return executeWithSavedInput(userMsg, opts, claudeDir)
+}
+
+func executeWithSavedInput(userMsg string, opts *options, claudeDir string) error {
 	// Initialize session
 	sess, err := initSession(opts, claudeDir)
 	if err != nil {
@@ -264,7 +372,7 @@ func run() error {
 	}
 
 	// Execute conversation with tool support
-	result, err := executeConversation(sess)
+	result, err := executeConversation(sess, userMsg)
 	if err != nil {
 		return err
 	}
@@ -305,6 +413,14 @@ func parseFlags() *options {
 		"replay response (empty=latest, or timestamp like 20260104_153022)")
 	flag.IntVar(&opts.pruneOld, "prune-old", 0,
 		"keep only last N request/response pairs, delete older")
+
+	// Cost estimation
+	flag.BoolVar(&opts.estimate, "estimate", false,
+		"estimate cost without executing (shows cost for piped input)")
+	flag.BoolVar(&opts.execute, "execute", false,
+		"re-execute last user message from conversation")
+	flag.Float64Var(&opts.maxCostFlag, "max-cost-override", 0,
+		"override max-cost for this run (use with --execute)")
 
 	// Core settings
 	flag.StringVar(&opts.model, "model", "",
@@ -396,12 +512,6 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 
 	timestamp := time.Now().Format("20060102_150405")
 
-	// Read user input
-	userMsg, err := readInput()
-	if err != nil {
-		return nil, err
-	}
-
 	if opts.isVerbose() {
 		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
 		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
@@ -449,7 +559,6 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		config:     cfg,
 		model:      selectedModel,
 		sysPrompt:  sysPrompt,
-		userMsg:    userMsg,
 		timestamp:  timestamp,
 		workingDir: workingDir,
 		client: &http.Client{
@@ -459,7 +568,7 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 }
 
 // executeConversation runs the agentic loop with tool support.
-func executeConversation(sess *session) (*conversationResult, error) {
+func executeConversation(sess *session, userMsg string) (*conversationResult, error) {
 	// Load conversation history
 	messages, err := loadConversationHistory(sess.claudeDir)
 	if err != nil {
@@ -471,7 +580,7 @@ func executeConversation(sess *session) (*conversationResult, error) {
 		Role: "user",
 		Content: []ContentBlock{{
 			Type: "text",
-			Text: sess.userMsg,
+			Text: userMsg,
 		}},
 	})
 
