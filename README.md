@@ -81,6 +81,66 @@ echo "run tests and fix failures" | claude --tool=all
 claude --tool=none
 ```
 
+### Cost Estimation
+
+Preview costs before executing expensive operations:
+
+```bash
+# Estimate cost before executing
+echo "refactor display.go to pkg/display/" | claude --tool=all --estimate
+
+# Output shows:
+#   Input tokens:  ~3,500
+#   Output tokens: ~1,200
+#   Total cost:    ~$0.033
+
+# Execute if cost is acceptable
+claude --execute --max-cost-override=0.05
+```
+
+**Workflows:**
+
+**Safe refactoring:**
+```bash
+# 1. Estimate
+echo "complex refactor task" | claude --tool=all --estimate
+
+# 2. Review cost, execute if OK
+claude --execute --max-cost-override=0.10
+
+# 3. Verify
+git diff
+go test ./...
+
+# 4. Commit or rollback
+git commit -m "refactor: ..." 
+# OR git reset --hard
+```
+
+**Retry with higher budget:**
+```bash
+# Hit cost limit
+echo "big task" | claude --tool=all
+# Error: max cost exceeded ($1.20 > $1.00)
+
+# Retry with override
+claude --execute --max-cost-override=2.00
+```
+
+**Re-run after manual changes:**
+```bash
+# Made code changes, want Claude to try again
+claude --execute --tool=write
+```
+
+**How it works:**
+- `--estimate` calculates tokens (4 chars/token heuristic), saves message, doesn't execute
+- `--execute` runs the last user message from conversation
+- `--max-cost-override` overrides default max-cost for this run
+- Model-specific pricing: Sonnet ($3/$15), Opus ($15/$75), Haiku ($0.80/$4)
+
+**Limitations:** Current estimation uses heuristics (good for dogfooding). Doesn't account for tool iterations or context truncation.
+
 ## How It Works
 
 ### Storage System
@@ -167,6 +227,11 @@ go test ./... 2>&1 | claude --tool=write
 - `--reset` - delete conversation history
 - `--replay[=TIMESTAMP]` - replay tool execution (empty = latest)
 - `--prune-old N` - keep only last N conversations
+
+### Cost Estimation
+- `--estimate` - show estimated cost without executing (saves message for --execute)
+- `--execute` - execute last user message from conversation history
+- `--max-cost-override N` - override max-cost for this run (use with --execute)
 
 ### Permissions
 - `--tool=""` - dry-run (default)
