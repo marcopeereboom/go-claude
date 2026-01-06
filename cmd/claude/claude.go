@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,11 +27,6 @@ const (
 	maxContextTokens     = 100000
 	defaultMaxIterations = 15
 	defaultMaxCost       = 1.0 // dollars
-	defaultSystemPrompt  = `You are a helpful coding assistant. Always wrap:
-- Filenames in backticks with language: ` + "```go filename.go```" + `
-- Code blocks in triple backticks with language specified
-- Shell commands in ` + "```bash```" + ` blocks
-This helps with automated extraction and saving.`
 
 	// Defaults
 	defaultMaxTokens = 8192
@@ -59,6 +55,9 @@ This helps with automated extraction and saving.`
 	// bash_command timeout
 	bashCommandTimeout = 30 * time.Second
 )
+
+//go:embed defaultprompt.txt
+var defaultSystemPrompt string
 
 // Command whitelist for bash_command tool
 var allowedCommands = map[string]bool{
@@ -643,14 +642,25 @@ func selectModel(flagModel, cfgModel string) string {
 }
 
 func selectSystemPrompt(flagPrompt, cfgPrompt string) string {
-	switch {
-	case flagPrompt != "":
+	// System prompt priority:
+	// 1. --system flag (highest priority - one-time override)
+	// 2. CLAUDE_SYSTEM_PROMPT env var (session-level)
+	// 3. config.json SystemPrompt (persisted across conversations)
+	// 4. defaultSystemPrompt (fallback)
+
+	if flagPrompt != "" {
 		return flagPrompt
-	case cfgPrompt != "":
-		return cfgPrompt
-	default:
-		return defaultSystemPrompt
 	}
+
+	if envPrompt := os.Getenv("CLAUDE_SYSTEM_PROMPT"); envPrompt != "" {
+		return envPrompt
+	}
+
+	if cfgPrompt != "" {
+		return cfgPrompt
+	}
+
+	return defaultSystemPrompt
 }
 
 func readInput() (string, error) {
@@ -1213,12 +1223,12 @@ func isSafePath(path, workingDir string) bool {
 	if err != nil {
 		return false
 	}
-	
+
 	// Clean both paths and ensure workingDir has trailing separator
 	// to prevent "/home/user/project" matching "/home/user/project-evil"
 	cleanWorking := filepath.Clean(workingDir) + string(filepath.Separator)
 	cleanAbs := filepath.Clean(abs) + string(filepath.Separator)
-	
+
 	return strings.HasPrefix(cleanAbs, cleanWorking)
 }
 
