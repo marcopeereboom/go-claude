@@ -1165,20 +1165,29 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 }
 
 func validateCommand(command string) error {
-	// Block dangerous patterns
-	blocked := []string{
-		"sudo", "su ", "rm ", "mv ", "cp ", "chmod", "chown",
-		"curl", "wget", "||", "&&",
-	}
-	for _, pattern := range blocked {
-		if strings.Contains(command, pattern) {
-			return fmt.Errorf("blocked pattern: %s", pattern)
+	// Check for command chaining operators first (highest priority)
+	// These allow bypassing other protections
+	chainOperators := []string{"||", "&&", ";"}
+	for _, op := range chainOperators {
+		if strings.Contains(command, op) {
+			return fmt.Errorf("blocked pattern: %s", op)
 		}
 	}
 
-	// Check for path traversal
+	// Check for path traversal (second priority)
 	if strings.Contains(command, "..") {
 		return fmt.Errorf("path traversal not allowed")
+	}
+
+	// Block dangerous commands (third priority)
+	blockedCommands := []string{
+		"sudo", "su ", "rm ", "mv ", "cp ", "chmod", "chown",
+		"curl", "wget",
+	}
+	for _, pattern := range blockedCommands {
+		if strings.Contains(command, pattern) {
+			return fmt.Errorf("blocked pattern: %s", pattern)
+		}
 	}
 
 	// Parse commands (handle pipes)
