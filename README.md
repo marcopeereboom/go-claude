@@ -12,6 +12,8 @@ Built for Unix workflows - no GUI, no IDE, just shell and vim.
 - **Request/response file pairs** - zero duplication, perfect audit trail
 - **Git-based rollbacks** - auto-commit before tool execution (coming soon)
 - **Permission system** - granular control over what Claude can do
+- **Syntax highlighting**: Chroma-powered code and diff coloring
+- **Audit logging**: Complete tool execution history
 
 ## Quick Start
 
@@ -46,6 +48,22 @@ claude --replay="" --tool=write
 ```bash
 claude --stats
 ```
+
+# View with syntax highlighting (automatic in terminal)
+echo "show me a web server in Go" | claude
+
+# Save without colors (automatic when piping)
+echo "show me a web server in Go" | claude > output.txt
+```
+
+## Syntax Highlighting
+
+The CLI automatically applies syntax highlighting when outputting to a terminal:
+- **200+ languages** supported via [chroma](https://github.com/alecthomas/chroma)
+- **Git-style diffs** for file changes
+- **No ANSI codes** in piped/file output
+
+See [docs/syntax-highlighting.md](docs/syntax-highlighting.md) for details.
 
 ### Permission System
 

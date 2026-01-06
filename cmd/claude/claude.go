@@ -615,8 +615,6 @@ func finalizeSession(sess *session, result *conversationResult) error {
 	}
 
 	// Output result
-	// TODO: add syntax highligted md and code blocks when printing to
-	// terminal. Do not write escape codes to any files ever.
 	return writeOutput(sess.opts.outputFile, sess.opts.wantsJSON(),
 		result.assistantText, result.respBody)
 }
@@ -791,12 +789,15 @@ func writeOutput(outputFile string, jsonOutput bool,
 			return fmt.Errorf("writing output file: %w", err)
 		}
 	default:
-		// Apply markdown formatting if TTY
+		// FormatResponse handles TTY check and chroma highlighting
 		if !jsonOutput && isTTY(os.Stdout) {
-			FormatMarkdown(os.Stdout, output)
-			fmt.Println() // trailing newline
+			FormatResponse(os.Stdout, output)
 		} else {
-			fmt.Println(output)
+			if strings.HasSuffix(output, "\n") {
+				fmt.Print(output)
+			} else {
+				fmt.Println(output)
+			}
 		}
 
 	}
