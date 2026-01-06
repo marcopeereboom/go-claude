@@ -393,7 +393,6 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 	cfg.Model = selectedModel
 
 	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
-	cfg.SystemPrompt = sysPrompt
 
 	timestamp := time.Now().Format("20060102_150405")
 
