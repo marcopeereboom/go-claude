@@ -1,6 +1,42 @@
 # go-claude Development Context
 
-**Last Updated:** 2026-01-05
+**Last Updated:** 2026-01-06
+
+## Recent Changes
+
+### Cost Estimation (2026-01-06)
+Added `--estimate` and `--execute` workflow for pre-flight cost checks.
+
+**New files:**
+- `cmd/claude/cost_estimation.go` - Token counting, pricing, display
+- `cmd/claude/cost_test.go` - Unit tests
+
+**Modified:**
+- `cmd/claude/claude.go` - Added estimate/execute modes in run()
+
+**Usage:**
+```bash
+echo "task" | claude --tool=all --estimate
+claude --execute --max-cost-override=0.05
+```
+
+**How it works:**
+- `--estimate` calculates tokens (4 chars/token), saves message, no API call
+- `--execute` loads last user message, executes it
+- `--max-cost-override` overrides max-cost for one run
+- Model-specific pricing: Sonnet ($3/$15), Opus ($15/$75), Haiku ($0.80/$4)
+
+**Implementation:**
+- Unpaired requests: --execute checks for request_*.json without response
+- Saves to conversation: --estimate writes request_TIMESTAMP.json
+- Reuses storage: no extra files, uses existing request/response pairs
+
+**Limitations:**
+- 4 chars/token heuristic (varies by language)
+- Output estimate: 30% of input, min 500 tokens
+- Single-turn only (doesn't account for tool iterations)
+
+Good enough for dogfooding refactors. Future: tiktoken for accuracy, multi-turn estimation.
 
 ## Project Overview
 Terminal-only CLI for Claude AI with tool support. Built for Unix workflows (tmux, vim, shell). No GUI, no IDE.
@@ -10,11 +46,13 @@ Terminal-only CLI for Claude AI with tool support. Built for Unix workflows (tmu
 ### File Structure
 ```
 cmd/claude/
-  ├── claude.go      # 1263 lines: Main CLI, API calls, tool execution
-  ├── storage.go     # 232 lines: Request/response pairs, audit log, replay
-  ├── display.go     # 344 lines: Terminal formatting, diffs, syntax highlighting
-  ├── api_test.go    # Mock API server, error handling tests
-  └── claude_test.go # Storage, options, helper function tests
+  ├── claude.go           # 1353 lines: Main CLI, API calls, tool execution
+  ├── storage.go          # 277 lines: Request/response pairs, audit log, replay
+  ├── display.go          # 378 lines: Terminal formatting, diffs, syntax highlighting
+  ├── cost_estimation.go  # 128 lines: Token counting, cost estimation
+  ├── api_test.go         # Mock API server, error handling tests
+  ├── claude_test.go      # Storage, options, helper function tests
+  └── cost_test.go        # Cost estimation tests
 ```
 
 ### Storage System (CRITICAL)
@@ -32,6 +70,11 @@ cmd/claude/
 - Easy pruning (delete old pairs)
 - Replay without API calls (saves tokens/cost)
 - DB export ready (SQLite/Postgres)
+
+**Cost Estimation Storage:**
+- `--estimate` creates `request_TIMESTAMP.json` without paired response
+- `--execute` handles unpaired requests (checks for request_*.json when no complete pairs exist)
+- After execution, complete pair exists: `request_TIMESTAMP.json` + `response_TIMESTAMP.json`
 
 **Conversation reconstruction:** Scan .claude/, sort by timestamp, pair up request/response files
 
@@ -68,6 +111,10 @@ cmd/claude/
   - `""` = dry-run (default) - shows what WOULD happen
   - `write` = execute file writes
   - `all` = execute everything
+- `--estimate` / `--execute` cost estimation workflow
+  - `--estimate` = show cost, save message, don't execute
+  - `--execute` = run last user message from conversation
+  - `--max-cost-override N` = override max-cost for this run
 - `--replay` = re-execute tools from saved response WITHOUT calling API
   - `--replay=""` = replay latest
   - `--replay=20060102_150405` = replay specific timestamp
@@ -95,6 +142,22 @@ go run ./cmd/claude --replay="" --tool=write
 
 # 4. Stats
 go run ./cmd/claude --stats
+```
+
+**Safe Refactoring Pattern:**
+```bash
+# 1. Estimate cost
+echo "refactor task" | go run ./cmd/claude --tool=all --estimate
+
+# 2. Review estimate (shows: ~$0.03)
+
+# 3. Execute if acceptable
+go run ./cmd/claude --execute --max-cost-override=0.05
+
+# 4. Verify and commit
+git diff
+go test ./...
+git commit -m "refactor: ..."
 ```
 
 ## Current State
