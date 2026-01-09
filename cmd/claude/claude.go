@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/marcopeereboom/go-claude/pkg/llm"
 )
 
 const (
@@ -54,6 +55,9 @@ const (
 
 	// bash_command timeout
 	bashCommandTimeout = 30 * time.Second
+
+	// Default Ollama URL
+	defaultOllamaURL = "http://localhost:11434"
 )
 
 //go:embed defaultprompt.txt
@@ -151,6 +155,7 @@ type options struct {
 	truncate      int
 	resumeDir     string
 	outputFile    string
+	ollamaURL     string
 
 	// Behavior
 	verbosity string
@@ -204,6 +209,7 @@ type session struct {
 	timestamp  string
 	workingDir string
 	client     *http.Client
+	llmClient  llm.LLM
 }
 
 // conversationResult holds the outcome of a conversation execution.
@@ -435,6 +441,8 @@ func parseFlags() *options {
 		"HTTP timeout in seconds")
 	flag.IntVar(&opts.truncate, "truncate", 0,
 		"keep only last N messages in conversation (0 = keep all)")
+	flag.StringVar(&opts.ollamaURL, "ollama-url", defaultOllamaURL,
+		"Ollama API URL (default: http://localhost:11434)")
 
 	// Behavior
 	flag.StringVar(&opts.verbosity, "verbosity", defaultVerbosity,
@@ -552,6 +560,14 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		return nil, fmt.Errorf("getting working dir: %w", err)
 	}
 
+	// Detect LLM provider based on model name
+	var llmClient llm.LLM
+	if strings.HasPrefix(selectedModel, "claude-") {
+		llmClient = llm.NewClaude(apiKey, apiURL)
+	} else {
+		llmClient = llm.NewOllama(selectedModel, opts.ollamaURL)
+	}
+
 	return &session{
 		opts:       opts,
 		claudeDir:  claudeDir,
@@ -564,6 +580,7 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		client: &http.Client{
 			Timeout: time.Duration(opts.timeout) * time.Second,
 		},
+		llmClient: llmClient,
 	}, nil
 }
 
