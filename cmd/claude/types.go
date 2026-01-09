@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/marcopeereboom/go-claude/pkg/llm"
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
 const (
@@ -52,6 +53,12 @@ type MessageContent = llm.MessageContent
 type Tool = llm.Tool
 type Usage = llm.Usage
 
+// Type aliases for storage types
+type Config = storage.Config
+type ModelsCache = storage.ModelsCache
+type AuditLogEntry = storage.AuditLogEntry
+type Request = storage.Request
+
 // API types (for backward compatibility with existing code)
 type APIRequest struct {
 	Model     string      `json:"model"`
@@ -61,16 +68,7 @@ type APIRequest struct {
 	Tools     []Tool      `json:"tools,omitempty"`
 }
 
-type APIResponse struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	Role       string         `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	Model      string         `json:"model"`
-	StopReason string         `json:"stop_reason"`
-	Usage      Usage          `json:"usage"`
-	Error      *APIError      `json:"error,omitempty"`
-}
+type APIResponse = storage.APIResponse
 
 type APIError struct {
 	Type    string `json:"type"`
