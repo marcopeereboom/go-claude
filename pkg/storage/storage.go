@@ -158,7 +158,7 @@ func ListRequestResponsePairs(claudeDir string) ([]string, error) {
 		}
 	}
 
-	// Sort timestamps chronologically
+	// Sort timestamps chronologically (oldest first)
 	result := make([]string, 0, len(timestamps))
 	for ts := range timestamps {
 		result = append(result, ts)
@@ -202,6 +202,9 @@ func SaveModelsCache(claudeDir string, cache *ModelsCache) error {
 }
 
 // PruneResponses deletes old request/response pairs, keeping last N
+// Both request and response files must be successfully deleted for a pair
+// to be considered pruned. If either deletion fails, the pair is skipped
+// and an error is returned indicating which pairs failed.
 func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
 	pairs, err := ListRequestResponsePairs(claudeDir)
 	if err != nil {
@@ -216,15 +219,36 @@ func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
 		return nil
 	}
 
+	// Calculate which pairs to delete (oldest ones)
+	// pairs is sorted oldest to newest, so we delete from the beginning
 	toDelete := pairs[:len(pairs)-keepLast]
+
+	var deleteErrors []string
+	deletedCount := 0
 
 	for _, ts := range toDelete {
 		reqPath := filepath.Join(claudeDir, fmt.Sprintf("request_%s.json", ts))
 		respPath := filepath.Join(claudeDir, fmt.Sprintf("response_%s.json", ts))
 
-		os.Remove(reqPath)
-		os.Remove(respPath)
+		// Attempt to delete request file
+		reqErr := os.Remove(reqPath)
+		respErr := os.Remove(respPath)
 
+		// Both must succeed for pair to be considered deleted
+		if reqErr != nil || respErr != nil {
+			if reqErr != nil {
+				deleteErrors = append(deleteErrors,
+					fmt.Sprintf("failed to delete request %s: %v", ts, reqErr))
+			}
+			if respErr != nil {
+				deleteErrors = append(deleteErrors,
+					fmt.Sprintf("failed to delete response %s: %v", ts, respErr))
+			}
+			continue
+		}
+
+		// Both deleted successfully
+		deletedCount++
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Pruned: %s\n", ts)
 		}
@@ -232,8 +256,15 @@ func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
 
 	if verbose {
 		fmt.Fprintf(os.Stderr, "Deleted %d pairs, kept %d\n",
-			len(toDelete), keepLast)
+			deletedCount, len(pairs)-deletedCount)
 	}
+
+	// If any deletions failed, return error with details
+	if len(deleteErrors) > 0 {
+		return fmt.Errorf("prune incomplete: %d errors:\n%s",
+			len(deleteErrors), strings.Join(deleteErrors, "\n"))
+	}
+
 	return nil
 }
 
