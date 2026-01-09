@@ -1,41 +1,48 @@
 // Package llm provides interfaces and types for interacting with different LLM backends.
-// Reuse MessageContent, ContentBlock, Tool, Usage from cmd/claude/claude.go for now.
-// Will consolidate later.
 package llm
 
 import "context"
+
+// ModelInfo contains metadata about an available model.
+type ModelInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Provider    string `json:"provider"` // "claude" or "ollama"
+}
 
 // LLM is the interface that all LLM backends must implement.
 type LLM interface {
 	// Generate sends a request to the LLM and returns the response.
 	Generate(ctx context.Context, req *Request) (*Response, error)
+
+	// ListModels returns all available models for this provider.
+	ListModels(ctx context.Context) ([]ModelInfo, error)
 }
 
 // Request contains all parameters needed for an LLM API call.
 type Request struct {
-	Model     string           // Model name (e.g., "claude-sonnet-4-5-20250929")
-	Messages  []MessageContent // Conversation history
-	Tools     []Tool           // Available tools
-	MaxTokens int              // Maximum tokens to generate
-	System    string           // System prompt
+	Model     string           `json:"model"`
+	Messages  []MessageContent `json:"messages"`
+	Tools     []Tool           `json:"tools,omitempty"`
+	MaxTokens int              `json:"max_tokens"`
+	System    string           `json:"system,omitempty"`
 }
 
 // Response contains the LLM's response.
 type Response struct {
-	Content    []ContentBlock // Response content (text and/or tool_use blocks)
-	StopReason string         // Why generation stopped (end_turn, tool_use, etc)
-	Usage      Usage          // Token usage statistics
+	Content    []ContentBlock `json:"content"`
+	StopReason string         `json:"stop_reason"`
+	Usage      Usage          `json:"usage"`
 }
 
 // MessageContent represents a single message in the conversation.
-// Defined in cmd/claude/claude.go - imported here for reference.
 type MessageContent struct {
 	Role    string         `json:"role"`
 	Content []ContentBlock `json:"content"`
 }
 
 // ContentBlock represents a piece of content (text, tool_use, or tool_result).
-// Defined in cmd/claude/claude.go - imported here for reference.
 type ContentBlock struct {
 	Type      string                 `json:"type"`
 	Text      string                 `json:"text,omitempty"`
@@ -47,7 +54,6 @@ type ContentBlock struct {
 }
 
 // Tool represents a tool that can be called by the LLM.
-// Defined in cmd/claude/claude.go - imported here for reference.
 type Tool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
@@ -55,7 +61,6 @@ type Tool struct {
 }
 
 // Usage contains token usage statistics.
-// Defined in cmd/claude/claude.go - imported here for reference.
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`

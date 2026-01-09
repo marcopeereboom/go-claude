@@ -10,17 +10,17 @@ import (
 )
 
 const (
-	apiVersion = "2023-06-01"
+	claudeAPIVersion = "2023-06-01"
 )
 
-// ClaudeClient implements LLM interface for Anthropic's Claude API
+// ClaudeClient implements the LLM interface for Claude API.
 type ClaudeClient struct {
 	apiKey  string
 	baseURL string
 	client  *http.Client
 }
 
-// NewClaude creates a new Claude API client
+// NewClaude creates a new Claude client.
 func NewClaude(apiKey, baseURL string) *ClaudeClient {
 	return &ClaudeClient{
 		apiKey:  apiKey,
@@ -29,41 +29,19 @@ func NewClaude(apiKey, baseURL string) *ClaudeClient {
 	}
 }
 
-// claudeRequest is the API request format for Claude
-type claudeRequest struct {
-	Model     string      `json:"model"`
-	MaxTokens int         `json:"max_tokens"`
-	System    string      `json:"system,omitempty"`
-	Messages  interface{} `json:"messages"`
-	Tools     []Tool      `json:"tools,omitempty"`
-}
-
-// claudeResponse is the API response format from Claude
-type claudeResponse struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	Role       string         `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	Model      string         `json:"model"`
-	StopReason string         `json:"stop_reason"`
-	Usage      Usage          `json:"usage"`
-	Error      *apiError      `json:"error,omitempty"`
-}
-
-type apiError struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
-// Generate sends a request to Claude API and returns the response
+// Generate sends a request to Claude API.
 func (c *ClaudeClient) Generate(ctx context.Context, req *Request) (*Response, error) {
-	// Build API request
-	apiReq := claudeRequest{
-		Model:     req.Model,
-		MaxTokens: req.MaxTokens,
-		System:    req.System,
-		Messages:  req.Messages,
-		Tools:     req.Tools,
+	// Convert to Claude API format
+	apiReq := map[string]interface{}{
+		"model":      req.Model,
+		"max_tokens": req.MaxTokens,
+		"messages":   req.Messages,
+	}
+	if req.System != "" {
+		apiReq["system"] = req.System
+	}
+	if len(req.Tools) > 0 {
+		apiReq["tools"] = req.Tools
 	}
 
 	reqBody, err := json.Marshal(apiReq)
@@ -76,9 +54,8 @@ func (c *ClaudeClient) Generate(ctx context.Context, req *Request) (*Response, e
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Set required headers
 	httpReq.Header.Set("x-api-key", c.apiKey)
-	httpReq.Header.Set("anthropic-version", apiVersion)
+	httpReq.Header.Set("anthropic-version", claudeAPIVersion)
 	httpReq.Header.Set("content-type", "application/json")
 
 	resp, err := c.client.Do(httpReq)
@@ -92,19 +69,17 @@ func (c *ClaudeClient) Generate(ctx context.Context, req *Request) (*Response, e
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
-	// Check HTTP status
-	if err := checkHTTPStatus(resp.StatusCode, respBody); err != nil {
-		return nil, err
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseClaudeError(resp.StatusCode, respBody)
 	}
 
-	var apiResp claudeResponse
+	var apiResp struct {
+		Content    []ContentBlock `json:"content"`
+		StopReason string         `json:"stop_reason"`
+		Usage      Usage          `json:"usage"`
+	}
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, fmt.Errorf("parsing response: %w\nBody: %s", err, respBody)
-	}
-
-	// Check for API-level errors
-	if apiResp.Error != nil {
-		return nil, fmt.Errorf("API error [%s]: %s", apiResp.Error.Type, apiResp.Error.Message)
+		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 
 	return &Response{
@@ -114,36 +89,53 @@ func (c *ClaudeClient) Generate(ctx context.Context, req *Request) (*Response, e
 	}, nil
 }
 
-func checkHTTPStatus(status int, body []byte) error {
-	// Try to parse Claude API error first (has more detail)
+// ListModels returns available Claude models.
+func (c *ClaudeClient) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	// Claude doesn't have a public models API endpoint yet
+	// Return hardcoded list of known models
+	return []ModelInfo{
+		{
+			ID:          "claude-opus-4-20250514",
+			Name:        "claude-opus-4-20250514",
+			Description: "Claude Opus 4",
+			Provider:    "claude",
+		},
+		{
+			ID:          "claude-sonnet-4-20250514",
+			Name:        "claude-sonnet-4-20250514",
+			Description: "Claude Sonnet 4",
+			Provider:    "claude",
+		},
+		{
+			ID:          "claude-sonnet-4-5-20250929",
+			Name:        "claude-sonnet-4-5-20250929",
+			Description: "Claude Sonnet 4.5",
+			Provider:    "claude",
+		},
+		{
+			ID:          "claude-haiku-4-5-20251001",
+			Name:        "claude-haiku-4-5-20251001",
+			Description: "Claude Haiku 4.5",
+			Provider:    "claude",
+		},
+		{
+			ID:          "claude-3-5-sonnet-20241022",
+			Name:        "claude-3-5-sonnet-20241022",
+			Description: "Claude 3.5 Sonnet",
+			Provider:    "claude",
+		},
+	}, nil
+}
+
+func parseClaudeError(statusCode int, body []byte) error {
 	var apiErr struct {
-		Error *apiError `json:"error"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error != nil {
+	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error.Type != "" {
 		return fmt.Errorf("API error [%s]: %s", apiErr.Error.Type, apiErr.Error.Message)
 	}
-
-	// Standard HTTP status codes
-	switch status {
-	case http.StatusOK:
-		return nil
-	case http.StatusBadRequest:
-		return fmt.Errorf("%s: %s", http.StatusText(status), body)
-	case http.StatusUnauthorized:
-		return fmt.Errorf("%s: check API key", http.StatusText(status))
-	case http.StatusForbidden:
-		return fmt.Errorf("%s: %s", http.StatusText(status), body)
-	case http.StatusNotFound:
-		return fmt.Errorf("%s: invalid endpoint", http.StatusText(status))
-	case http.StatusTooManyRequests:
-		return fmt.Errorf("%s: %s", http.StatusText(status), body)
-	case http.StatusInternalServerError:
-		return fmt.Errorf("%s: %s", http.StatusText(status), body)
-	case http.StatusServiceUnavailable:
-		return fmt.Errorf("%s: %s", http.StatusText(status), body)
-	case 529: // Anthropic-specific: overloaded
-		return fmt.Errorf("service overloaded (529): %s", body)
-	default:
-		return fmt.Errorf("HTTP %d: %s", status, body)
-	}
+	return fmt.Errorf("API error %d: %s", statusCode, string(body))
 }

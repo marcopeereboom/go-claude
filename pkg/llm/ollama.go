@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // OllamaClient implements the LLM interface for Ollama.
@@ -18,9 +19,6 @@ type OllamaClient struct {
 
 // NewOllama creates a new Ollama client.
 func NewOllama(model, baseURL string) *OllamaClient {
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
 	return &OllamaClient{
 		model:   model,
 		baseURL: baseURL,
@@ -28,68 +26,48 @@ func NewOllama(model, baseURL string) *OllamaClient {
 	}
 }
 
-// ollamaMessage represents Ollama's message format
-type ollamaMessage struct {
-	Role    string                   `json:"role"`
-	Content string                   `json:"content"`
-	Tools   []map[string]interface{} `json:"tool_calls,omitempty"`
-}
-
-// ollamaRequest represents the Ollama API request
-type ollamaRequest struct {
-	Model    string          `json:"model"`
-	Messages []ollamaMessage `json:"messages"`
-	Tools    []Tool          `json:"tools,omitempty"`
-	Stream   bool            `json:"stream"`
-}
-
-// ollamaResponse represents the Ollama API response
-type ollamaResponse struct {
-	Model     string        `json:"model"`
-	CreatedAt string        `json:"created_at"`
-	Message   ollamaMessage `json:"message"`
-	Done      bool          `json:"done"`
-}
-
-// Generate implements the LLM interface for Ollama.
+// Generate sends a request to Ollama API.
 func (o *OllamaClient) Generate(ctx context.Context, req *Request) (*Response, error) {
-	// Convert our messages to Ollama format
-	ollamaMessages := make([]ollamaMessage, 0, len(req.Messages))
-	
-	// Add system message if provided
-	if req.System != "" {
-		ollamaMessages = append(ollamaMessages, ollamaMessage{
-			Role:    "system",
-			Content: req.System,
-		})
-	}
-	
-	// Convert conversation history
+	// Convert messages to Ollama format
+	var messages []map[string]interface{}
 	for _, msg := range req.Messages {
-		ollamaMsg := o.convertToOllamaMessage(msg)
-		ollamaMessages = append(ollamaMessages, ollamaMsg)
+		content := ""
+		for _, block := range msg.Content {
+			if block.Type == "text" {
+				content += block.Text
+			}
+		}
+		messages = append(messages, map[string]interface{}{
+			"role":    msg.Role,
+			"content": content,
+		})
 	}
 
 	// Build Ollama request
-	ollamaReq := ollamaRequest{
-		Model:    o.model,
-		Messages: ollamaMessages,
-		Tools:    req.Tools,
-		Stream:   false,
+	apiReq := map[string]interface{}{
+		"model":    o.model,
+		"messages": messages,
+		"stream":   false,
+	}
+	if req.System != "" {
+		apiReq["system"] = req.System
+	}
+	if len(req.Tools) > 0 {
+		apiReq["tools"] = convertToolsToOllama(req.Tools)
 	}
 
-	reqBody, err := json.Marshal(ollamaReq)
+	reqBody, err := json.Marshal(apiReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	// Make API call
-	url := fmt.Sprintf("%s/api/chat", o.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
+	endpoint := strings.TrimRight(o.baseURL, "/") + "/api/chat"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpReq.Header.Set("content-type", "application/json")
 
 	resp, err := o.client.Do(httpReq)
 	if err != nil {
@@ -97,110 +75,122 @@ func (o *OllamaClient) Generate(ctx context.Context, req *Request) (*Response, e
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
 	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var apiResp struct {
+		Message struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Function struct {
+					Name      string                 `json:"name"`
+					Arguments map[string]interface{} `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls,omitempty"`
+		} `json:"message"`
+		Done bool `json:"done"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+
+	// Convert Ollama response to unified format
+	var content []ContentBlock
+	stopReason := "end_turn"
+
+	if len(apiResp.Message.ToolCalls) > 0 {
+		// Tool use response
+		for _, tc := range apiResp.Message.ToolCalls {
+			content = append(content, ContentBlock{
+				Type:  "tool_use",
+				ID:    fmt.Sprintf("call_%s", tc.Function.Name),
+				Name:  tc.Function.Name,
+				Input: tc.Function.Arguments,
+			})
+		}
+		stopReason = "tool_use"
+	} else {
+		// Text response
+		content = []ContentBlock{{
+			Type: "text",
+			Text: apiResp.Message.Content,
+		}}
+	}
+
+	return &Response{
+		Content:    content,
+		StopReason: stopReason,
+		Usage: Usage{
+			InputTokens:  0, // Ollama doesn't provide token counts
+			OutputTokens: 0,
+		},
+	}, nil
+}
+
+// ListModels returns available Ollama models.
+func (o *OllamaClient) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	endpoint := strings.TrimRight(o.baseURL, "/") + "/api/tags"
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	resp, err := o.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("making API call: %w", err)
+	}
+	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
-	var ollamaResp ollamaResponse
-	if err := json.Unmarshal(respBody, &ollamaResp); err != nil {
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var apiResp struct {
+		Models []struct {
+			Name       string `json:"name"`
+			Model      string `json:"model"`
+			ModifiedAt string `json:"modified_at"`
+			Size       int64  `json:"size"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
 		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 
-	// Convert Ollama response to our format
-	return o.convertFromOllamaResponse(&ollamaResp)
-}
-
-// convertToOllamaMessage converts our MessageContent to Ollama's format
-func (o *OllamaClient) convertToOllamaMessage(msg MessageContent) ollamaMessage {
-	ollamaMsg := ollamaMessage{
-		Role: msg.Role,
-	}
-
-	// Combine all text blocks into content
-	var textParts []string
-	var toolCalls []map[string]interface{}
-
-	for _, block := range msg.Content {
-		switch block.Type {
-		case "text":
-			textParts = append(textParts, block.Text)
-		case "tool_use":
-			// Ollama format for tool calls
-			toolCalls = append(toolCalls, map[string]interface{}{
-				"id":   block.ID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      block.Name,
-					"arguments": block.Input,
-				},
-			})
-		case "tool_result":
-			// Tool results go in content as JSON
-			resultJSON, _ := json.Marshal(map[string]interface{}{
-				"tool_use_id": block.ToolUseID,
-				"content":     block.Content,
-			})
-			textParts = append(textParts, string(resultJSON))
-		}
-	}
-
-	if len(textParts) > 0 {
-		ollamaMsg.Content = textParts[0] // For now, just use first text block
-	}
-	if len(toolCalls) > 0 {
-		ollamaMsg.Tools = toolCalls
-	}
-
-	return ollamaMsg
-}
-
-// convertFromOllamaResponse converts Ollama's response to our format
-func (o *OllamaClient) convertFromOllamaResponse(resp *ollamaResponse) (*Response, error) {
-	result := &Response{
-		Content:    []ContentBlock{},
-		StopReason: "end_turn",
-		Usage: Usage{
-			InputTokens:  0, // Ollama doesn't provide token counts
-			OutputTokens: 0,
-		},
-	}
-
-	// Add text content if present
-	if resp.Message.Content != "" {
-		result.Content = append(result.Content, ContentBlock{
-			Type: "text",
-			Text: resp.Message.Content,
+	var models []ModelInfo
+	for _, m := range apiResp.Models {
+		models = append(models, ModelInfo{
+			ID:       m.Name,
+			Name:     m.Name,
+			Provider: "ollama",
 		})
 	}
 
-	// Convert tool calls if present
-	if len(resp.Message.Tools) > 0 {
-		result.StopReason = "tool_use"
-		for _, toolCall := range resp.Message.Tools {
-			// Extract function call details
-			funcData, ok := toolCall["function"].(map[string]interface{})
-			if !ok {
-				continue
-			}
+	return models, nil
+}
 
-			name, _ := funcData["name"].(string)
-			args, _ := funcData["arguments"].(map[string]interface{})
-			id, _ := toolCall["id"].(string)
-
-			result.Content = append(result.Content, ContentBlock{
-				Type:  "tool_use",
-				ID:    id,
-				Name:  name,
-				Input: args,
-			})
-		}
+func convertToolsToOllama(tools []Tool) []map[string]interface{} {
+	var ollamaTools []map[string]interface{}
+	for _, tool := range tools {
+		ollamaTools = append(ollamaTools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  tool.InputSchema,
+			},
+		})
 	}
-
-	return result, nil
+	return ollamaTools
 }

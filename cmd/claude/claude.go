@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	defaultModel         = "claude-sonnet-4-5-20250929"
+	defaultModel         = "claude-sonnet-4-20250514"
 	apiVersion           = "2023-06-01"
 	maxContextTokens     = 100000
 	defaultMaxIterations = 15
@@ -107,43 +107,24 @@ type APIError struct {
 	Message string `json:"message"`
 }
 
-type ContentBlock struct {
-	Type      string                 `json:"type"`
-	Text      string                 `json:"text,omitempty"`
-	ID        string                 `json:"id,omitempty"`
-	Name      string                 `json:"name,omitempty"`
-	Input     map[string]interface{} `json:"input,omitempty"`
-	ToolUseID string                 `json:"tool_use_id,omitempty"`
-	Content   string                 `json:"content,omitempty"`
-}
-
-type MessageContent struct {
-	Role    string         `json:"role"`
-	Content []ContentBlock `json:"content"`
-}
-
-type Tool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
-}
-
-type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-}
+// Type aliases for LLM interface types
+type ContentBlock = llm.ContentBlock
+type MessageContent = llm.MessageContent
+type Tool = llm.Tool
+type Usage = llm.Usage
 
 // CLI options
 type options struct {
 	// Modes
-	listModels  bool
-	reset       bool
-	showStats   bool
-	replay      string
-	pruneOld    int
-	estimate    bool
-	execute     bool
-	maxCostFlag float64
+	modelsList    bool
+	modelsRefresh bool
+	reset         bool
+	showStats     bool
+	replay        string
+	pruneOld      int
+	estimate      bool
+	execute       bool
+	maxCostFlag   float64
 
 	// Core
 	maxTokens     int
@@ -231,6 +212,15 @@ func run() error {
 	claudeDir, err := getClaudeDir(opts.resumeDir)
 	if err != nil {
 		return err
+	}
+
+	// Handle models commands first (don't need stdin)
+	if opts.modelsList {
+		return listModelsCommand(claudeDir, opts.ollamaURL)
+	}
+
+	if opts.modelsRefresh {
+		return refreshModelsCommand(claudeDir, opts.ollamaURL)
 	}
 
 	// Handle --execute mode (use last message from conversation)
@@ -331,10 +321,6 @@ func run() error {
 	}
 
 	// Handle special modes that don't need full setup
-	if opts.listModels {
-		return listModels()
-	}
-
 	if opts.showStats {
 		return showStats(claudeDir)
 	}
@@ -408,8 +394,10 @@ func parseFlags() *options {
 	}
 
 	// Modes
-	flag.BoolVar(&opts.listModels, "list-models", false,
-		"list supported Claude models")
+	flag.BoolVar(&opts.modelsList, "models-list", false,
+		"list available Claude and Ollama models (creates cache if missing)")
+	flag.BoolVar(&opts.modelsRefresh, "models-refresh", false,
+		"refresh models cache from Claude API and Ollama")
 	flag.BoolVar(&opts.reset, "reset", false,
 		"reset conversation (delete .claude/ directory)")
 	flag.BoolVar(&opts.showStats, "stats", false,
@@ -442,7 +430,7 @@ func parseFlags() *options {
 	flag.IntVar(&opts.truncate, "truncate", 0,
 		"keep only last N messages in conversation (0 = keep all)")
 	flag.StringVar(&opts.ollamaURL, "ollama-url", defaultOllamaURL,
-		"Ollama API URL (default: http://localhost:11434)")
+		"Ollama API URL")
 
 	// Behavior
 	flag.StringVar(&opts.verbosity, "verbosity", defaultVerbosity,
@@ -463,17 +451,6 @@ func parseFlags() *options {
 	flag.Parse()
 
 	return opts
-}
-
-func listModels() error {
-	// TODO: Query https://docs.anthropic.com/en/docs/about-claude/models
-	// for dynamic model list instead of hardcoding
-	fmt.Fprintln(os.Stderr, "Supported Claude models:")
-	fmt.Fprintln(os.Stderr, "  claude-opus-4-20250514")
-	fmt.Fprintln(os.Stderr, "  claude-sonnet-4-5-20250929")
-	fmt.Fprintln(os.Stderr, "  claude-sonnet-4-20250514")
-	fmt.Fprintln(os.Stderr, "  claude-haiku-4-5-20251001")
-	return nil
 }
 
 func showStats(claudeDir string) error {
@@ -515,6 +492,11 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 
 	selectedModel := selectModel(opts.model, cfg.Model)
 	cfg.Model = selectedModel
+
+	// Validate model exists in cache
+	if err := validateModel(selectedModel, claudeDir, opts.ollamaURL); err != nil {
+		return nil, err
+	}
 
 	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
 
@@ -616,11 +598,32 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 
 	// Agentic loop: iterate until Claude is done or limits reached
 	for i := 0; i < maxIter; i++ {
-		apiResp, respBody, err := callAPI(sess.client, sess.apiKey,
-			sess.model, sess.opts.maxTokens, sess.sysPrompt, messages,
-			sess.opts)
+		// Call LLM via unified interface
+		req := &llm.Request{
+			Model:     sess.model,
+			Messages:  messages,
+			Tools:     getTools(sess.opts),
+			MaxTokens: sess.opts.maxTokens,
+			System:    sess.sysPrompt,
+		}
+
+		ctx := context.Background()
+		llmResp, err := sess.llmClient.Generate(ctx, req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("LLM API call failed: %w", err)
+		}
+
+		// Convert to existing APIResponse format for backward compat
+		apiResp := &APIResponse{
+			Content:    llmResp.Content,
+			StopReason: llmResp.StopReason,
+			Usage:      llmResp.Usage,
+		}
+
+		// Marshal response for saving
+		respBody, err := json.Marshal(apiResp)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling response: %w", err)
 		}
 
 		if apiResp.Error != nil {

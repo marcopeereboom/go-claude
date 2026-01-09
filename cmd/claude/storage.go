@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/marcopeereboom/go-claude/pkg/llm"
 )
 
 // Request is what we send to the API (saved for replay/audit)
@@ -23,6 +26,12 @@ type Config struct {
 	TotalOutput  int    `json:"total_output_tokens"`
 	FirstRun     string `json:"first_run"`
 	LastRun      string `json:"last_run"`
+}
+
+// ModelsCache stores cached model listings from providers
+type ModelsCache struct {
+	LastUpdated time.Time       `json:"last_updated"`
+	Models      []llm.ModelInfo `json:"models"`
 }
 
 // AuditLogEntry represents a single tool execution for audit trail
@@ -146,6 +155,28 @@ func loadOrCreateConfig(path string) *Config {
 	}
 	json.Unmarshal(data, cfg)
 	return cfg
+}
+
+// loadModelsCache loads cached models from disk
+func loadModelsCache(claudeDir string) (*ModelsCache, error) {
+	path := filepath.Join(claudeDir, "models.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cache ModelsCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, err
+	}
+
+	return &cache, nil
+}
+
+// saveModelsCache saves model cache to disk
+func saveModelsCache(claudeDir string, cache *ModelsCache) error {
+	path := filepath.Join(claudeDir, "models.json")
+	return saveJSON(path, cache)
 }
 
 // pruneResponses deletes old request/response pairs, keeping last N
