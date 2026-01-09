@@ -1,4 +1,4 @@
-package main
+package claude
 
 import (
 	"context"
@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"github.com/marcopeereboom/go-claude/pkg/llm"
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
-// initSession sets up all state needed for a conversation.
-func initSession(opts *options, claudeDir string) (*session, error) {
+// InitSession sets up all state needed for a conversation.
+func InitSession(opts *Options, claudeDir, apiURL, defaultSystemPrompt string) (*session, error) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
@@ -26,53 +27,53 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 
 	// Load configuration
 	configPath := filepath.Join(claudeDir, "config.json")
-	cfg := loadOrCreateConfig(configPath)
+	cfg := storage.LoadOrCreateConfig(configPath)
 
-	selectedModel := selectModel(opts.model, cfg.Model)
+	selectedModel := SelectModel(opts.Model, cfg.Model)
 	cfg.Model = selectedModel
 
 	// Validate model exists in cache
-	if err := validateModel(selectedModel, claudeDir, opts.ollamaURL); err != nil {
+	if err := ValidateModel(selectedModel, claudeDir, opts.OllamaURL); err != nil {
 		return nil, err
 	}
 
-	sysPrompt := selectSystemPrompt(opts.systemPrompt, cfg.SystemPrompt)
+	sysPrompt := SelectSystemPrompt(opts.SystemPrompt, cfg.SystemPrompt, defaultSystemPrompt)
 
 	timestamp := time.Now().Format("20060102_150405")
 
-	if opts.isVerbose() {
+	if opts.IsVerbose() {
 		fmt.Fprintf(os.Stderr, "Claude dir: %s\n", claudeDir)
 		fmt.Fprintf(os.Stderr, "Model: %s\n", selectedModel)
 	}
 
 	// Load conversation history from request/response pairs
-	messages, err := loadConversationHistory(claudeDir)
+	messages, err := storage.LoadConversationHistory(claudeDir)
 	if err != nil {
 		return nil, err
 	}
 
-	if opts.isVerbose() {
+	if opts.IsVerbose() {
 		fmt.Fprintf(os.Stderr, "Loaded %d messages\n", len(messages))
 	}
 
 	// Handle truncation
-	if opts.truncate > 0 && len(messages) > opts.truncate {
-		if opts.isVerbose() {
+	if opts.Truncate > 0 && len(messages) > opts.Truncate {
+		if opts.IsVerbose() {
 			fmt.Fprintf(os.Stderr, "Truncating: %d → %d messages\n",
-				len(messages), opts.truncate)
+				len(messages), opts.Truncate)
 		}
-		messages = messages[len(messages)-opts.truncate:]
+		messages = messages[len(messages)-opts.Truncate:]
 	}
 
 	// Check context size (will add user message in executeConversation)
-	estimatedTokens := estimateTokens(messages)
-	if estimatedTokens > maxContextTokens {
+	estimatedTokens := EstimateTokens(messages)
+	if estimatedTokens > MaxContextTokens {
 		return nil, fmt.Errorf(
 			"conversation too large (%d tokens, max %d)\n"+
 				"Options:\n"+
 				"  claude --reset           # start fresh\n"+
 				"  claude --truncate N      # keep last N messages",
-			estimatedTokens, maxContextTokens)
+			estimatedTokens, MaxContextTokens)
 	}
 
 	workingDir, err := os.Getwd()
@@ -85,7 +86,7 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 	if strings.HasPrefix(selectedModel, "claude-") {
 		llmClient = llm.NewClaude(apiKey, apiURL)
 	} else {
-		llmClient = llm.NewOllama(selectedModel, opts.ollamaURL)
+		llmClient = llm.NewOllama(selectedModel, opts.OllamaURL)
 	}
 
 	return &session{
@@ -98,16 +99,16 @@ func initSession(opts *options, claudeDir string) (*session, error) {
 		timestamp:  timestamp,
 		workingDir: workingDir,
 		client: &http.Client{
-			Timeout: time.Duration(opts.timeout) * time.Second,
+			Timeout: time.Duration(opts.Timeout) * time.Second,
 		},
 		llmClient: llmClient,
 	}, nil
 }
 
-// executeConversation runs the agentic loop with tool support.
-func executeConversation(sess *session, userMsg string) (*conversationResult, error) {
+// ExecuteConversation runs the agentic loop with tool support.
+func ExecuteConversation(sess *session, userMsg string) (*conversationResult, error) {
 	// Load conversation history
-	messages, err := loadConversationHistory(sess.claudeDir)
+	messages, err := storage.LoadConversationHistory(sess.claudeDir)
 	if err != nil {
 		return nil, err
 	}
@@ -122,14 +123,14 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 	})
 
 	// Save request before calling API
-	if err := saveRequest(sess.claudeDir, sess.timestamp, messages); err != nil {
+	if err := storage.SaveRequest(sess.claudeDir, sess.timestamp, messages); err != nil {
 		return nil, fmt.Errorf("saving request: %w", err)
 	}
 
 	var responses []json.RawMessage
 	iterationCost := 0.0
 
-	maxIter := sess.opts.maxIterations
+	maxIter := sess.opts.MaxIterations
 	if maxIter == 0 {
 		maxIter = 1000 // Effective unlimited
 	}
@@ -140,8 +141,8 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 		req := &llm.Request{
 			Model:     sess.model,
 			Messages:  messages,
-			Tools:     getTools(sess.opts),
-			MaxTokens: sess.opts.maxTokens,
+			Tools:     GetTools(sess.opts),
+			MaxTokens: sess.opts.MaxTokens,
 			System:    sess.sysPrompt,
 		}
 
@@ -165,7 +166,7 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 		}
 
 		if apiResp.Error != nil {
-			if sess.opts.wantsJSON() {
+			if sess.opts.WantsJSON() {
 				fmt.Println(string(respBody))
 			}
 			return nil, fmt.Errorf("API error [%s]: %s",
@@ -178,17 +179,17 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 		iterationCost += costIn + costOut
 
 		// Check cost limit
-		if sess.opts.maxCost > 0 && iterationCost > sess.opts.maxCost {
+		if sess.opts.MaxCost > 0 && iterationCost > sess.opts.MaxCost {
 			return nil, fmt.Errorf(
 				"max cost exceeded ($%.4f > $%.4f) after %d iterations",
-				iterationCost, sess.opts.maxCost, i+1)
+				iterationCost, sess.opts.MaxCost, i+1)
 		}
 
 		// Update token counts
 		sess.config.TotalInput += apiResp.Usage.InputTokens
 		sess.config.TotalOutput += apiResp.Usage.OutputTokens
 
-		if sess.opts.isVerbose() {
+		if sess.opts.IsVerbose() {
 			fmt.Fprintf(os.Stderr,
 				"Iteration %d - Tokens: %d in, %d out (cost: $%.4f)\n",
 				i+1, apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
@@ -208,14 +209,14 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 		switch apiResp.StopReason {
 		case "end_turn":
 			// Conversation complete - save response
-			assistantText := extractResponse(apiResp)
+			assistantText := ExtractResponse(apiResp)
 
 			// Save all responses as array
 			responsesJSON, err := json.MarshalIndent(responses, "", "\t")
 			if err != nil {
 				return nil, fmt.Errorf("marshaling responses: %w", err)
 			}
-			if err := saveResponse(sess.claudeDir, sess.timestamp, responsesJSON); err != nil {
+			if err := storage.SaveResponse(sess.claudeDir, sess.timestamp, responsesJSON); err != nil {
 				return nil, fmt.Errorf("saving responses: %w", err)
 			}
 
@@ -226,8 +227,8 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 
 		case "tool_use":
 			// Execute tools and continue
-			toolResults, err := executeTools(apiResp.Content,
-				sess.workingDir, sess.opts, sess.timestamp)
+			toolResults, err := ExecuteTools(apiResp.Content,
+				sess.workingDir, sess.claudeDir, sess.opts, sess.timestamp)
 			if err != nil {
 				return nil, err
 			}
@@ -247,8 +248,8 @@ func executeConversation(sess *session, userMsg string) (*conversationResult, er
 	return nil, fmt.Errorf("max iterations (%d) reached", maxIter)
 }
 
-// finalizeSession saves all state and outputs the result.
-func finalizeSession(sess *session, result *conversationResult) error {
+// FinalizeSession saves all state and outputs the result.
+func FinalizeSession(sess *session, result *conversationResult, saveJSONFunc func(string, interface{}) error, writeOutputFunc func(string, bool, string, []byte) error) error {
 	// Update timestamps
 	sess.config.LastRun = sess.timestamp
 	if sess.config.FirstRun == "" {
@@ -257,27 +258,27 @@ func finalizeSession(sess *session, result *conversationResult) error {
 
 	// Save config
 	configPath := filepath.Join(sess.claudeDir, "config.json")
-	if err := saveJSON(configPath, sess.config); err != nil {
+	if err := saveJSONFunc(configPath, sess.config); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
 	// Output result
-	return writeOutput(sess.opts.outputFile, sess.opts.wantsJSON(),
+	return writeOutputFunc(sess.opts.OutputFile, sess.opts.WantsJSON(),
 		result.assistantText, result.respBody)
 }
 
-func selectModel(flagModel, cfgModel string) string {
+func SelectModel(flagModel, cfgModel string) string {
 	switch {
 	case flagModel != "":
 		return flagModel
 	case cfgModel != "":
 		return cfgModel
 	default:
-		return defaultModel
+		return DefaultModel
 	}
 }
 
-func selectSystemPrompt(flagPrompt, cfgPrompt string) string {
+func SelectSystemPrompt(flagPrompt, cfgPrompt, defaultSystemPrompt string) string {
 	// System prompt priority:
 	// 1. --system flag (highest priority - one-time override)
 	// 2. CLAUDE_SYSTEM_PROMPT env var (session-level)
@@ -299,7 +300,7 @@ func selectSystemPrompt(flagPrompt, cfgPrompt string) string {
 	return defaultSystemPrompt
 }
 
-func estimateTokens(messages []MessageContent) int {
+func EstimateTokens(messages []MessageContent) int {
 	// Rough estimate: ~4 chars per token
 	total := 0
 	for _, msg := range messages {
@@ -312,7 +313,7 @@ func estimateTokens(messages []MessageContent) int {
 	return total
 }
 
-func extractResponse(apiResp *APIResponse) string {
+func ExtractResponse(apiResp *APIResponse) string {
 	for _, content := range apiResp.Content {
 		if content.Type == "text" {
 			return content.Text

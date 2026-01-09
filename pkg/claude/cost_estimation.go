@@ -1,4 +1,4 @@
-package main
+package claude
 
 import (
 	"fmt"
@@ -23,8 +23,8 @@ type ModelPricing struct {
 	OutputPerMillion float64
 }
 
-// estimateCost calculates rough cost estimate based on conversation size
-func estimateCost(userMsg string, history []MessageContent, model string) *CostEstimate {
+// EstimateCost calculates rough cost estimate based on conversation size
+func EstimateCost(userMsg string, history []MessageContent, model string) *CostEstimate {
 	// Count tokens in conversation history
 	historyTokens := 0
 	for _, msg := range history {
@@ -38,8 +38,8 @@ func estimateCost(userMsg string, history []MessageContent, model string) *CostE
 	// Count tokens in user message
 	userTokens := len(userMsg) / 4
 
-	// System prompt tokens (roughly)
-	systemTokens := len(defaultSystemPrompt) / 4
+	// System prompt tokens (roughly) - using embedded default
+	systemTokens := 500 // rough estimate
 
 	// Total input
 	inputTokens := historyTokens + userTokens + systemTokens
@@ -51,7 +51,7 @@ func estimateCost(userMsg string, history []MessageContent, model string) *CostE
 	}
 
 	// Get pricing for model
-	pricing := getModelPricing(model)
+	pricing := GetModelPricing(model)
 
 	// Calculate cost
 	inputCost := float64(inputTokens) * pricing.InputPerMillion / 1_000_000
@@ -69,8 +69,8 @@ func estimateCost(userMsg string, history []MessageContent, model string) *CostE
 	}
 }
 
-// getModelPricing returns pricing per million tokens for a model
-func getModelPricing(model string) ModelPricing {
+// GetModelPricing returns pricing per million tokens for a model (exported for tests)
+func GetModelPricing(model string) ModelPricing {
 	// Sonnet 4.5 pricing
 	if strings.Contains(model, "sonnet") {
 		return ModelPricing{
@@ -102,8 +102,8 @@ func getModelPricing(model string) ModelPricing {
 	}
 }
 
-// getLastUserMessage extracts the most recent user message from conversation
-func getLastUserMessage(messages []MessageContent) (string, error) {
+// GetLastUserMessage extracts the most recent user message from conversation
+func GetLastUserMessage(messages []MessageContent) (string, error) {
 	// Search backwards for last user message
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -117,8 +117,8 @@ func getLastUserMessage(messages []MessageContent) (string, error) {
 	return "", fmt.Errorf("no user message found in conversation")
 }
 
-// displayEstimate shows cost estimation to user
-func displayEstimate(estimate *CostEstimate) {
+// DisplayEstimate shows cost estimation to user
+func DisplayEstimate(estimate *CostEstimate) {
 	fmt.Fprintln(os.Stderr, "\nAnalyzing task...")
 	fmt.Fprintln(os.Stderr, "\nEstimated Execution:")
 	fmt.Fprintf(os.Stderr, "  Input tokens:  ~%d\n", estimate.InputTokens)
@@ -126,7 +126,7 @@ func displayEstimate(estimate *CostEstimate) {
 	fmt.Fprintf(os.Stderr, "  Total cost:    ~$%.3f\n\n", estimate.TotalCost)
 	fmt.Fprintf(os.Stderr, "  Model: %s\n", estimate.Model)
 	
-	pricing := getModelPricing(estimate.Model)
+	pricing := GetModelPricing(estimate.Model)
 	fmt.Fprintf(os.Stderr, "  Pricing: $%.2f/million input, $%.2f/million output\n\n",
 		pricing.InputPerMillion, pricing.OutputPerMillion)
 

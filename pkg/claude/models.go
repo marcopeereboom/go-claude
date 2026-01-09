@@ -1,4 +1,4 @@
-package main
+package claude
 
 import (
 	"context"
@@ -9,14 +9,15 @@ import (
 	"time"
 
 	"github.com/marcopeereboom/go-claude/pkg/llm"
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
-// listModelsCommand handles --models-list flag
-func listModelsCommand(claudeDir, ollamaURL string) error {
-	cache, err := loadModelsCache(claudeDir)
+// ListModelsCommand handles --models-list flag
+func ListModelsCommand(claudeDir, ollamaURL string) error {
+	cache, err := storage.LoadModelsCache(claudeDir)
 	if err != nil || cache == nil {
 		// No cache exists - fetch and create
-		cache, err = refreshModelsCache(claudeDir, ollamaURL)
+		cache, err = RefreshModelsCache(claudeDir, ollamaURL)
 		if err != nil {
 			return fmt.Errorf("fetching models: %w", err)
 		}
@@ -32,9 +33,9 @@ func listModelsCommand(claudeDir, ollamaURL string) error {
 	return nil
 }
 
-// refreshModelsCommand handles --models-refresh flag
-func refreshModelsCommand(claudeDir, ollamaURL string) error {
-	cache, err := refreshModelsCache(claudeDir, ollamaURL)
+// RefreshModelsCommand handles --models-refresh flag
+func RefreshModelsCommand(claudeDir, ollamaURL string) error {
+	cache, err := RefreshModelsCache(claudeDir, ollamaURL)
 	if err != nil {
 		return err
 	}
@@ -47,8 +48,8 @@ func refreshModelsCommand(claudeDir, ollamaURL string) error {
 	return nil
 }
 
-// refreshModelsCache queries Claude and Ollama for available models
-func refreshModelsCache(claudeDir, ollamaURL string) (*ModelsCache, error) {
+// RefreshModelsCache queries Claude and Ollama for available models
+func RefreshModelsCache(claudeDir, ollamaURL string) (*storage.ModelsCache, error) {
 	ctx := context.Background()
 
 	var allModels []llm.ModelInfo
@@ -56,7 +57,7 @@ func refreshModelsCache(claudeDir, ollamaURL string) (*ModelsCache, error) {
 	// Query Claude models
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey != "" {
-		client := llm.NewClaude(apiKey, apiURL)
+		client := llm.NewClaude(apiKey, "https://api.anthropic.com/v1/messages")
 		models, err := client.ListModels(ctx)
 		if err != nil {
 			// Non-fatal: continue with hardcoded list
@@ -90,13 +91,13 @@ func refreshModelsCache(claudeDir, ollamaURL string) (*ModelsCache, error) {
 		return allModels[i].Name < allModels[j].Name
 	})
 
-	cache := &ModelsCache{
+	cache := &storage.ModelsCache{
 		LastUpdated: time.Now(),
 		Models:      allModels,
 	}
 
 	// Save cache
-	if err := saveModelsCache(claudeDir, cache); err != nil {
+	if err := storage.SaveModelsCache(claudeDir, cache); err != nil {
 		return nil, fmt.Errorf("saving models cache: %w", err)
 	}
 
@@ -116,13 +117,13 @@ func getDefaultClaudeModels() []llm.ModelInfo {
 	}
 }
 
-// validateModel checks if model exists in cache
+// ValidateModel checks if model exists in cache
 // If no cache, creates one and validates
-func validateModel(model, claudeDir, ollamaURL string) error {
-	cache, err := loadModelsCache(claudeDir)
+func ValidateModel(model, claudeDir, ollamaURL string) error {
+	cache, err := storage.LoadModelsCache(claudeDir)
 	if err != nil || cache == nil {
 		// Try to create cache
-		cache, err = refreshModelsCache(claudeDir, ollamaURL)
+		cache, err = RefreshModelsCache(claudeDir, ollamaURL)
 		if err != nil {
 			// Can't validate - allow it
 			return nil

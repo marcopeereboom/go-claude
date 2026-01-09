@@ -1,10 +1,13 @@
-package main
+package claude_test
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/marcopeereboom/go-claude/pkg/claude"
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
 // TestSaveAndLoadRequestResponse tests the basic storage cycle
@@ -13,19 +16,19 @@ func TestSaveAndLoadRequestResponse(t *testing.T) {
 	timestamp := "20260105_120000"
 
 	// Create test messages
-	messages := []MessageContent{
+	messages := []storage.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []storage.ContentBlock{
 				{Type: "text", Text: "hello"},
 			},
 		},
 	}
 
 	// Save request
-	err := saveRequest(tmpDir, timestamp, messages)
+	err := storage.SaveRequest(tmpDir, timestamp, messages)
 	if err != nil {
-		t.Fatalf("saveRequest failed: %v", err)
+		t.Fatalf("SaveRequest failed: %v", err)
 	}
 
 	// Verify request file exists
@@ -35,19 +38,19 @@ func TestSaveAndLoadRequestResponse(t *testing.T) {
 	}
 
 	// Save response
-	resp := []APIResponse{{
+	resp := []storage.APIResponse{{
 		ID:   "test-id",
 		Type: "message",
 		Role: "assistant",
-		Content: []ContentBlock{
+		Content: []storage.ContentBlock{
 			{Type: "text", Text: "world"},
 		},
 		StopReason: "end_turn",
 	}}
 	respBody, _ := json.Marshal(resp)
-	err = saveResponse(tmpDir, timestamp, respBody)
+	err = storage.SaveResponse(tmpDir, timestamp, respBody)
 	if err != nil {
-		t.Fatalf("saveResponse failed: %v", err)
+		t.Fatalf("SaveResponse failed: %v", err)
 	}
 
 	// Verify response file exists
@@ -64,16 +67,16 @@ func TestListRequestResponsePairs(t *testing.T) {
 	// Create complete pairs
 	timestamps := []string{"20260105_100000", "20260105_110000"}
 	for _, ts := range timestamps {
-		saveRequest(tmpDir, ts, []MessageContent{})
-		saveResponse(tmpDir, ts, []byte("[]"))
+		storage.SaveRequest(tmpDir, ts, []storage.MessageContent{})
+		storage.SaveResponse(tmpDir, ts, []byte("[]"))
 	}
 
 	// Create orphan request (no response)
-	saveRequest(tmpDir, "20260105_120000", []MessageContent{})
+	storage.SaveRequest(tmpDir, "20260105_120000", []storage.MessageContent{})
 
-	pairs, err := listRequestResponsePairs(tmpDir)
+	pairs, err := storage.ListRequestResponsePairs(tmpDir)
 	if err != nil {
-		t.Fatalf("listRequestResponsePairs failed: %v", err)
+		t.Fatalf("ListRequestResponsePairs failed: %v", err)
 	}
 
 	// Should only return complete pairs
@@ -93,46 +96,46 @@ func TestLoadConversationHistory(t *testing.T) {
 
 	// Save first turn
 	ts1 := "20260105_100000"
-	messages1 := []MessageContent{
+	messages1 := []storage.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []storage.ContentBlock{
 				{Type: "text", Text: "question 1"},
 			},
 		},
 	}
-	saveRequest(tmpDir, ts1, messages1)
-	resp1 := []APIResponse{{
-		Content: []ContentBlock{
+	storage.SaveRequest(tmpDir, ts1, messages1)
+	resp1 := []storage.APIResponse{{
+		Content: []storage.ContentBlock{
 			{Type: "text", Text: "answer 1"},
 		},
 	}}
 	respBody1, _ := json.Marshal(resp1)
-	saveResponse(tmpDir, ts1, respBody1)
+	storage.SaveResponse(tmpDir, ts1, respBody1)
 
 	// Save second turn
 	ts2 := "20260105_110000"
-	messages2 := []MessageContent{
+	messages2 := []storage.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []storage.ContentBlock{
 				{Type: "text", Text: "question 2"},
 			},
 		},
 	}
-	saveRequest(tmpDir, ts2, messages2)
-	resp2 := []APIResponse{{
-		Content: []ContentBlock{
+	storage.SaveRequest(tmpDir, ts2, messages2)
+	resp2 := []storage.APIResponse{{
+		Content: []storage.ContentBlock{
 			{Type: "text", Text: "answer 2"},
 		},
 	}}
 	respBody2, _ := json.Marshal(resp2)
-	saveResponse(tmpDir, ts2, respBody2)
+	storage.SaveResponse(tmpDir, ts2, respBody2)
 
 	// Load history
-	history, err := loadConversationHistory(tmpDir)
+	history, err := storage.LoadConversationHistory(tmpDir)
 	if err != nil {
-		t.Fatalf("loadConversationHistory failed: %v", err)
+		t.Fatalf("LoadConversationHistory failed: %v", err)
 	}
 
 	// Should have 4 messages: user, assistant, user, assistant
@@ -168,18 +171,18 @@ func TestPruneResponses(t *testing.T) {
 		"20260105_140000",
 	}
 	for _, ts := range timestamps {
-		saveRequest(tmpDir, ts, []MessageContent{})
-		saveResponse(tmpDir, ts, []byte("[]"))
+		storage.SaveRequest(tmpDir, ts, []storage.MessageContent{})
+		storage.SaveResponse(tmpDir, ts, []byte("[]"))
 	}
 
 	// Prune to keep last 2
-	err := pruneResponses(tmpDir, 2, false)
+	err := storage.PruneResponses(tmpDir, 2, false)
 	if err != nil {
-		t.Fatalf("pruneResponses failed: %v", err)
+		t.Fatalf("PruneResponses failed: %v", err)
 	}
 
 	// Verify only last 2 remain
-	pairs, _ := listRequestResponsePairs(tmpDir)
+	pairs, _ := storage.ListRequestResponsePairs(tmpDir)
 	if len(pairs) != 2 {
 		t.Errorf("expected 2 pairs after prune, got %d", len(pairs))
 	}
@@ -196,7 +199,7 @@ func TestLoadOrCreateConfig(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "config.json")
 
 	// Load non-existent config (should return empty)
-	cfg1 := loadOrCreateConfig(configPath)
+	cfg1 := storage.LoadOrCreateConfig(configPath)
 	if cfg1.Model != "" {
 		t.Error("new config should have empty model")
 	}
@@ -204,10 +207,10 @@ func TestLoadOrCreateConfig(t *testing.T) {
 	// Save config
 	cfg1.Model = "test-model"
 	cfg1.TotalInput = 1000
-	saveJSON(configPath, cfg1)
+	storage.SaveJSON(configPath, cfg1)
 
 	// Load existing config
-	cfg2 := loadOrCreateConfig(configPath)
+	cfg2 := storage.LoadOrCreateConfig(configPath)
 	if cfg2.Model != "test-model" {
 		t.Errorf("expected model 'test-model', got '%s'", cfg2.Model)
 	}
@@ -236,18 +239,19 @@ func TestOptionsHelperMethods(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{tool: tt.tool}
+			opts := claude.NewOptions()
+			opts.SetTool(tt.tool)
 
-			if got := opts.canExecuteWrite(); got != tt.canWrite {
-				t.Errorf("canExecuteWrite() = %v, want %v",
+			if got := opts.CanExecuteWrite(); got != tt.canWrite {
+				t.Errorf("CanExecuteWrite() = %v, want %v",
 					got, tt.canWrite)
 			}
-			if got := opts.canExecuteCommand(); got != tt.canCommand {
-				t.Errorf("canExecuteCommand() = %v, want %v",
+			if got := opts.CanExecuteCommand(); got != tt.canCommand {
+				t.Errorf("CanExecuteCommand() = %v, want %v",
 					got, tt.canCommand)
 			}
-			if got := opts.canUseTools(); got != tt.canUseTools {
-				t.Errorf("canUseTools() = %v, want %v",
+			if got := opts.CanUseTools(); got != tt.canUseTools {
+				t.Errorf("CanUseTools() = %v, want %v",
 					got, tt.canUseTools)
 			}
 		})
@@ -270,16 +274,17 @@ func TestVerbosityLevels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.verbosity, func(t *testing.T) {
-			opts := &options{verbosity: tt.verbosity}
+			opts := claude.NewOptions()
+			opts.SetVerbosity(tt.verbosity)
 
-			if got := opts.isVerbose(); got != tt.verbose {
-				t.Errorf("isVerbose() = %v, want %v", got, tt.verbose)
+			if got := opts.IsVerbose(); got != tt.verbose {
+				t.Errorf("IsVerbose() = %v, want %v", got, tt.verbose)
 			}
-			if got := opts.isDebug(); got != tt.debug {
-				t.Errorf("isDebug() = %v, want %v", got, tt.debug)
+			if got := opts.IsDebug(); got != tt.debug {
+				t.Errorf("IsDebug() = %v, want %v", got, tt.debug)
 			}
-			if got := opts.isSilent(); got != tt.silent {
-				t.Errorf("isSilent() = %v, want %v", got, tt.silent)
+			if got := opts.IsSilent(); got != tt.silent {
+				t.Errorf("IsSilent() = %v, want %v", got, tt.silent)
 			}
 		})
 	}
@@ -287,22 +292,22 @@ func TestVerbosityLevels(t *testing.T) {
 
 // TestEstimateTokens tests token estimation
 func TestEstimateTokens(t *testing.T) {
-	messages := []MessageContent{
+	messages := []claude.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: "1234"}, // ~1 token
 			},
 		},
 		{
 			Role: "assistant",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: "12345678"}, // ~2 tokens
 			},
 		},
 	}
 
-	tokens := estimateTokens(messages)
+	tokens := claude.EstimateTokens(messages)
 	if tokens != 3 {
 		t.Errorf("expected ~3 tokens, got %d", tokens)
 	}
@@ -314,10 +319,10 @@ func TestResponseArrayFormat(t *testing.T) {
 	timestamp := "20260105_120000"
 
 	// Create multi-iteration response
-	responses := []APIResponse{
+	responses := []storage.APIResponse{
 		{
 			ID: "iter1",
-			Content: []ContentBlock{
+			Content: []storage.ContentBlock{
 				{
 					Type: "tool_use",
 					ID:   "tool1",
@@ -328,7 +333,7 @@ func TestResponseArrayFormat(t *testing.T) {
 		},
 		{
 			ID: "iter2",
-			Content: []ContentBlock{
+			Content: []storage.ContentBlock{
 				{Type: "text", Text: "final answer"},
 			},
 			StopReason: "end_turn",
@@ -336,16 +341,16 @@ func TestResponseArrayFormat(t *testing.T) {
 	}
 
 	respBody, _ := json.Marshal(responses)
-	err := saveResponse(tmpDir, timestamp, respBody)
+	err := storage.SaveResponse(tmpDir, timestamp, respBody)
 	if err != nil {
-		t.Fatalf("saveResponse failed: %v", err)
+		t.Fatalf("SaveResponse failed: %v", err)
 	}
 
 	// Read back and verify it's an array
 	respPath := filepath.Join(tmpDir, "response_20260105_120000.json")
 	data, _ := os.ReadFile(respPath)
 
-	var loaded []APIResponse
+	var loaded []storage.APIResponse
 	err = json.Unmarshal(data, &loaded)
 	if err != nil {
 		t.Fatalf("failed to parse response array: %v", err)

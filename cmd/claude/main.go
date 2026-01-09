@@ -4,14 +4,16 @@ package main
 
 import (
 	_ "embed"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+
+	"github.com/marcopeereboom/go-claude/pkg/claude"
+	"github.com/marcopeereboom/go-claude/pkg/display"
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
 //go:embed defaultprompt.txt
@@ -37,16 +39,16 @@ func run() error {
 
 	// Handle models commands first (don't need stdin)
 	if opts.modelsList {
-		return listModelsCommand(claudeDir, opts.ollamaURL)
+		return claude.ListModelsCommand(claudeDir, opts.ollamaURL)
 	}
 
 	if opts.modelsRefresh {
-		return refreshModelsCommand(claudeDir, opts.ollamaURL)
+		return claude.RefreshModelsCommand(claudeDir, opts.ollamaURL)
 	}
 
 	// Handle --execute mode (use last message from conversation)
 	if opts.execute {
-		messages, err := loadConversationHistory(claudeDir)
+		messages, err := storage.LoadConversationHistory(claudeDir)
 		if err != nil {
 			return fmt.Errorf("loading conversation: %w", err)
 		}
@@ -55,7 +57,7 @@ func run() error {
 
 		// Try to get last user message from completed conversation
 		if len(messages) > 0 {
-			userMsg, err = getLastUserMessage(messages)
+			userMsg, err = claude.GetLastUserMessage(messages)
 			if err != nil {
 				return fmt.Errorf("no user message in conversation")
 			}
@@ -68,10 +70,11 @@ func run() error {
 			for _, entry := range entries {
 				if strings.HasPrefix(entry.Name(), "request_") {
 					reqPath := filepath.Join(claudeDir, entry.Name())
-					var req Request
-					data, _ := os.ReadFile(reqPath)
-					json.Unmarshal(data, &req)
-					userMsg, _ = getLastUserMessage(req.Messages)
+					req, err := storage.LoadRequest(reqPath)
+					if err != nil {
+						continue
+					}
+					userMsg, _ = claude.GetLastUserMessage(req.Messages)
 					break
 				}
 			}
@@ -103,38 +106,38 @@ func run() error {
 		}
 
 		// Load conversation history
-		messages, _ := loadConversationHistory(claudeDir)
+		messages, _ := storage.LoadConversationHistory(claudeDir)
 
 		// Get model for pricing
 		configPath := filepath.Join(claudeDir, "config.json")
-		cfg := loadOrCreateConfig(configPath)
-		model := selectModel(opts.model, cfg.Model)
+		cfg := storage.LoadOrCreateConfig(configPath)
+		model := claude.SelectModel(opts.model, cfg.Model)
 
 		// Estimate and display
-		estimate := estimateCost(userMsg, messages, model)
-		displayEstimate(estimate)
+		estimate := claude.EstimateCost(userMsg, messages, model)
+		claude.DisplayEstimate(estimate)
 
 		// Save this message to conversation so --execute can use it
-		timestamp := time.Now().Format("20060102_150405")
-		messages = append(messages, MessageContent{
+		messages = append(messages, claude.MessageContent{
 			Role: "user",
-			Content: []ContentBlock{{
+			Content: []claude.ContentBlock{{
 				Type: "text",
 				Text: userMsg,
 			}},
 		})
-		if err := saveRequest(claudeDir, timestamp, messages); err != nil {
+		timestamp := storage.CurrentTimestamp()
+		if err := storage.SaveRequest(claudeDir, timestamp, messages); err != nil {
 			return fmt.Errorf("saving request: %w", err)
 		}
 
 		// Update config
 		cfg.Model = model
-		cfg.LastRun = timestamp
 		if cfg.FirstRun == "" {
-			cfg.FirstRun = timestamp
+			cfg.FirstRun = storage.CurrentTimestamp()
 		}
+		cfg.LastRun = storage.CurrentTimestamp()
 		configPath = filepath.Join(claudeDir, "config.json")
-		if err := saveJSON(configPath, cfg); err != nil {
+		if err := storage.SaveJSON(configPath, cfg); err != nil {
 			return fmt.Errorf("saving config: %w", err)
 		}
 
@@ -151,11 +154,11 @@ func run() error {
 	}
 
 	if opts.replay != "NOREPLAY" {
-		return replayResponse(claudeDir, opts)
+		return claude.ReplayResponse(claudeDir, toClaudeOptions(opts))
 	}
 
 	if opts.pruneOld > 0 {
-		return pruneResponses(claudeDir, opts.pruneOld, opts.isVerbose())
+		return storage.PruneResponses(claudeDir, opts.pruneOld, opts.isVerbose())
 	}
 
 	// Check if stdin is a pipe/redirect, not interactive terminal
@@ -179,19 +182,47 @@ func run() error {
 
 func executeWithSavedInput(userMsg string, opts *options, claudeDir string) error {
 	// Initialize session
-	sess, err := initSession(opts, claudeDir)
+	sess, err := claude.InitSession(toClaudeOptions(opts), claudeDir, apiURL, defaultSystemPrompt)
 	if err != nil {
 		return err
 	}
 
 	// Execute conversation with tool support
-	result, err := executeConversation(sess, userMsg)
+	result, err := claude.ExecuteConversation(sess, userMsg)
 	if err != nil {
 		return err
 	}
 
 	// Save and output results
-	return finalizeSession(sess, result)
+	return claude.FinalizeSession(sess, result, storage.SaveJSON, writeOutput)
+}
+
+// toClaudeOptions converts main options to claude.Options
+func toClaudeOptions(opts *options) *claude.Options {
+	return &claude.Options{
+		Model:          opts.model,
+		MaxTokens:      opts.maxTokens,
+		MaxCost:        opts.maxCost,
+		MaxIterations:  opts.maxIterations,
+		Timeout:        opts.timeout,
+		Truncate:       opts.truncate,
+		OllamaURL:      opts.ollamaURL,
+		Verbosity:      opts.verbosity,
+		Tool:           opts.tool,
+		Output:         opts.output,
+		SystemPrompt:   opts.systemPrompt,
+		ResumeDir:      opts.resumeDir,
+		OutputFile:     opts.outputFile,
+		Replay:         opts.replay,
+		MaxCostFlag:    opts.maxCostFlag,
+		ModelsList:     opts.modelsList,
+		ModelsRefresh:  opts.modelsRefresh,
+		Reset:          opts.reset,
+		ShowStats:      opts.showStats,
+		PruneOld:       opts.pruneOld,
+		Estimate:       opts.estimate,
+		Execute:        opts.execute,
+	}
 }
 
 func parseFlags() *options {
@@ -239,26 +270,26 @@ func parseFlags() *options {
 
 	// Core settings
 	flag.StringVar(&opts.model, "model", "",
-		fmt.Sprintf("model to use (default: %s)", defaultModel))
-	flag.IntVar(&opts.maxTokens, "max-tokens", defaultMaxTokens,
+		fmt.Sprintf("model to use (default: %s)", claude.DefaultModel))
+	flag.IntVar(&opts.maxTokens, "max-tokens", claude.DefaultMaxTokens,
 		"maximum tokens per API call")
-	flag.Float64Var(&opts.maxCost, "max-cost", defaultMaxCost,
+	flag.Float64Var(&opts.maxCost, "max-cost", claude.DefaultMaxCost,
 		"maximum cost in dollars per conversation (0 = unlimited)")
-	flag.IntVar(&opts.maxIterations, "max-iterations", defaultMaxIterations,
+	flag.IntVar(&opts.maxIterations, "max-iterations", claude.DefaultMaxIterations,
 		"maximum tool loop iterations (0 = unlimited)")
-	flag.IntVar(&opts.timeout, "timeout", defaultTimeout,
+	flag.IntVar(&opts.timeout, "timeout", claude.DefaultTimeout,
 		"HTTP timeout in seconds")
 	flag.IntVar(&opts.truncate, "truncate", 0,
 		"keep only last N messages in conversation (0 = keep all)")
-	flag.StringVar(&opts.ollamaURL, "ollama-url", defaultOllamaURL,
+	flag.StringVar(&opts.ollamaURL, "ollama-url", claude.DefaultOllamaURL,
 		"Ollama API URL")
 
 	// Behavior
-	flag.StringVar(&opts.verbosity, "verbosity", defaultVerbosity,
+	flag.StringVar(&opts.verbosity, "verbosity", claude.DefaultVerbosity,
 		"output verbosity: silent, normal, verbose, debug")
-	flag.StringVar(&opts.tool, "tool", defaultTool,
+	flag.StringVar(&opts.tool, "tool", claude.DefaultTool,
 		"tool permissions: \"\" (dry-run), none, read, write, command, all, or comma-separated")
-	flag.StringVar(&opts.output, "output", defaultOutput,
+	flag.StringVar(&opts.output, "output", claude.DefaultOutput,
 		"output format: text, json")
 
 	// Advanced
@@ -275,9 +306,9 @@ func parseFlags() *options {
 }
 
 func showStats(claudeDir string) error {
-	cfg := loadOrCreateConfig(filepath.Join(claudeDir, "config.json"))
+	cfg := storage.LoadOrCreateConfig(filepath.Join(claudeDir, "config.json"))
 
-	pairs, err := listRequestResponsePairs(claudeDir)
+	pairs, err := storage.ListRequestResponsePairs(claudeDir)
 	if err != nil {
 		return err
 	}
@@ -341,8 +372,8 @@ func writeOutput(outputFile string, jsonOutput bool,
 		}
 	default:
 		// FormatResponse handles TTY check and chroma highlighting
-		if !jsonOutput && isTTY(os.Stdout) {
-			FormatResponse(os.Stdout, output)
+		if !jsonOutput && display.IsTTY(os.Stdout) {
+			display.FormatResponse(os.Stdout, output)
 		} else {
 			if strings.HasSuffix(output, "\n") {
 				fmt.Print(output)
@@ -366,15 +397,32 @@ func resetConversation(claudeDir string, verbose bool) error {
 	return nil
 }
 
-func saveJSON(path string, v interface{}) error {
-	data, err := json.MarshalIndent(v, "", "\t")
-	if err != nil {
-		return fmt.Errorf("marshaling JSON: %w", err)
-	}
+// options holds command-line options (local to cmd/claude)
+type options struct {
+	model          string
+	maxTokens      int
+	maxCost        float64
+	maxIterations  int
+	timeout        int
+	truncate       int
+	ollamaURL      string
+	verbosity      string
+	tool           string
+	output         string
+	systemPrompt   string
+	resumeDir      string
+	outputFile     string
+	replay         string
+	maxCostFlag    float64
+	modelsList     bool
+	modelsRefresh  bool
+	reset          bool
+	showStats      bool
+	pruneOld       int
+	estimate       bool
+	execute        bool
+}
 
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("writing file: %w", err)
-	}
-
-	return nil
+func (o *options) isVerbose() bool {
+	return o.verbosity == claude.VerbosityVerbose || o.verbosity == claude.VerbosityDebug
 }

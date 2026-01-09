@@ -1,9 +1,12 @@
-package main
+package claude_test
 
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/marcopeereboom/go-claude/pkg/claude"
 )
 
 // TestToolPermissions verifies the permission checking logic
@@ -68,23 +71,23 @@ func TestToolPermissions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{tool: tt.toolFlag}
+			opts := &claude.Options{Tool: tt.toolFlag}
 
-			gotWrite := opts.canExecuteWrite()
+			gotWrite := opts.CanExecuteWrite()
 			if gotWrite != tt.expectWrite {
-				t.Errorf("canExecuteWrite() = %v, want %v",
+				t.Errorf("CanExecuteWrite() = %v, want %v",
 					gotWrite, tt.expectWrite)
 			}
 
-			gotCommand := opts.canExecuteCommand()
+			gotCommand := opts.CanExecuteCommand()
 			if gotCommand != tt.expectCommand {
-				t.Errorf("canExecuteCommand() = %v, want %v",
+				t.Errorf("CanExecuteCommand() = %v, want %v",
 					gotCommand, tt.expectCommand)
 			}
 
-			gotUseTools := opts.canUseTools()
+			gotUseTools := opts.CanUseTools()
 			if gotUseTools != tt.expectUseTools {
-				t.Errorf("canUseTools() = %v, want %v",
+				t.Errorf("CanUseTools() = %v, want %v",
 					gotUseTools, tt.expectUseTools)
 			}
 		})
@@ -94,6 +97,7 @@ func TestToolPermissions(t *testing.T) {
 // TestWriteFileExecution verifies write_file actually writes
 func TestWriteFileExecution(t *testing.T) {
 	tmpDir := t.TempDir()
+	claudeDir := t.TempDir() // Separate dir for .claude storage
 	testFile := filepath.Join(tmpDir, "test.txt")
 
 	tests := []struct {
@@ -128,12 +132,12 @@ func TestWriteFileExecution(t *testing.T) {
 			// Clean up test file
 			os.Remove(testFile)
 
-			opts := &options{
-				tool:      tt.toolFlag,
-				verbosity: "silent",
+			opts := &claude.Options{
+				Tool:      tt.toolFlag,
+				Verbosity: "silent",
 			}
 
-			toolUse := ContentBlock{
+			toolUse := claude.ContentBlock{
 				Type: "tool_use",
 				ID:   "test-id",
 				Name: "write_file",
@@ -143,9 +147,9 @@ func TestWriteFileExecution(t *testing.T) {
 				},
 			}
 
-			result, err := executeWriteFile(toolUse, tmpDir, opts, "test-conv")
+			result, err := claude.ExecuteWriteFile(toolUse, tmpDir, claudeDir, opts, "test-conv")
 			if err != nil {
-				t.Fatalf("executeWriteFile failed: %v", err)
+				t.Fatalf("ExecuteWriteFile failed: %v", err)
 			}
 
 			// Check if file exists
@@ -155,7 +159,7 @@ func TestWriteFileExecution(t *testing.T) {
 			if fileExists != tt.shouldWrite {
 				t.Errorf("file exists = %v, want %v", fileExists, tt.shouldWrite)
 				t.Logf("tool flag: %q", tt.toolFlag)
-				t.Logf("canExecuteWrite: %v", opts.canExecuteWrite())
+				t.Logf("CanExecuteWrite: %v", opts.CanExecuteWrite())
 				t.Logf("result content: %s", result.Content)
 			}
 
@@ -173,6 +177,7 @@ func TestWriteFileExecution(t *testing.T) {
 // TestBashCommandExecution verifies bash_command execution
 func TestBashCommandExecution(t *testing.T) {
 	tmpDir := t.TempDir()
+	claudeDir := t.TempDir() // Separate dir for .claude storage
 
 	tests := []struct {
 		name         string
@@ -240,12 +245,12 @@ func TestBashCommandExecution(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{
-				tool:      tt.toolFlag,
-				verbosity: "silent",
+			opts := &claude.Options{
+				Tool:      tt.toolFlag,
+				Verbosity: "silent",
 			}
 
-			toolUse := ContentBlock{
+			toolUse := claude.ContentBlock{
 				Type: "tool_use",
 				ID:   "test-id",
 				Name: "bash_command",
@@ -255,9 +260,9 @@ func TestBashCommandExecution(t *testing.T) {
 				},
 			}
 
-			result, err := executeBashCommand(toolUse, tmpDir, opts, "test-conv")
+			result, err := claude.ExecuteBashCommand(toolUse, tmpDir, claudeDir, opts, "test-conv")
 			if err != nil {
-				t.Fatalf("executeBashCommand returned error: %v", err)
+				t.Fatalf("ExecuteBashCommand returned error: %v", err)
 			}
 
 			// Check if validation error occurred
@@ -267,7 +272,7 @@ func TestBashCommandExecution(t *testing.T) {
 				}
 				// Error should be in Content
 				if tt.errorPattern != "" && 
-					!contains(result.Content, tt.errorPattern) {
+					!strings.Contains(result.Content, tt.errorPattern) {
 					t.Errorf("expected error containing %q, got %q",
 						tt.errorPattern, result.Content)
 				}
@@ -275,16 +280,16 @@ func TestBashCommandExecution(t *testing.T) {
 			}
 
 			// Check if command was executed or dry-run
-			isDryRun := contains(result.Content, "Dry-run")
-			wasExecuted := contains(result.Content, "Exit code")
+			isDryRun := strings.Contains(result.Content, "Dry-run")
+			wasExecuted := strings.Contains(result.Content, "Exit code")
 
 			if tt.shouldExec && !wasExecuted {
 				t.Errorf("command should execute but got dry-run\n"+
 					"tool flag: %q\n"+
-					"canExecuteCommand: %v\n"+
+					"CanExecuteCommand: %v\n"+
 					"result: %s",
 					tt.toolFlag,
-					opts.canExecuteCommand(),
+					opts.CanExecuteCommand(),
 					result.Content)
 			}
 
@@ -392,37 +397,22 @@ func TestBashCommandValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateCommand(tt.command)
+			err := claude.ValidateCommand(tt.command)
 
 			if tt.wantErr && err == nil {
-				t.Errorf("validateCommand() expected error, got nil")
+				t.Errorf("ValidateCommand() expected error, got nil")
 			}
 
 			if !tt.wantErr && err != nil {
-				t.Errorf("validateCommand() unexpected error: %v", err)
+				t.Errorf("ValidateCommand() unexpected error: %v", err)
 			}
 
 			if tt.wantErr && err != nil && tt.errMsg != "" {
-				if !contains(err.Error(), tt.errMsg) {
+				if !strings.Contains(err.Error(), tt.errMsg) {
 					t.Errorf("error = %q, want substring %q",
 						err.Error(), tt.errMsg)
 				}
 			}
 		})
 	}
-}
-
-// Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		(s == substr || len(s) > 0 && anySubstring(s, substr))
-}
-
-func anySubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

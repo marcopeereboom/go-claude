@@ -69,6 +69,26 @@ type AuditLogEntry struct {
 	Error          string                 `json:"error,omitempty"`
 }
 
+// CurrentTimestamp returns the current timestamp in the standard format
+func CurrentTimestamp() string {
+	return time.Now().Format("20060102_150405")
+}
+
+// LoadRequest loads a request from the given path
+func LoadRequest(path string) (*Request, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read request: %w", err)
+	}
+
+	var req Request
+	if err := json.Unmarshal(data, &req); err != nil {
+		return nil, fmt.Errorf("unmarshal request: %w", err)
+	}
+
+	return &req, nil
+}
+
 // SaveRequest saves the request (conversation context + user message) to disk
 func SaveRequest(claudeDir, timestamp string, messages []MessageContent) error {
 	req := Request{

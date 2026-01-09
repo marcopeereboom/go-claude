@@ -1,4 +1,4 @@
-package main
+package claude
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/marcopeereboom/go-claude/pkg/storage"
 )
 
 // Command whitelist for bash_command tool
@@ -27,8 +29,8 @@ var allowedCommands = map[string]bool{
 	"go":   true, // all go subcommands allowed
 }
 
-func getTools(opts *options) []Tool {
-	if !opts.canUseTools() {
+func GetTools(opts *Options) []Tool {
+	if !opts.CanUseTools() {
 		return nil
 	}
 
@@ -90,16 +92,16 @@ Use 'reason' to explain why this command is needed (for audit trail).`,
 	}}
 }
 
-func executeTool(toolUse ContentBlock, workingDir string,
-	opts *options, conversationID string,
+func ExecuteTool(toolUse ContentBlock, workingDir string, claudeDir string,
+	opts *Options, conversationID string,
 ) (ContentBlock, error) {
 	switch toolUse.Name {
 	case "read_file":
-		return executeReadFile(toolUse, workingDir, opts, conversationID)
+		return ExecuteReadFile(toolUse, workingDir, claudeDir, opts, conversationID)
 	case "write_file":
-		return executeWriteFile(toolUse, workingDir, opts, conversationID)
+		return ExecuteWriteFile(toolUse, workingDir, claudeDir, opts, conversationID)
 	case "bash_command":
-		return executeBashCommand(toolUse, workingDir, opts,
+		return ExecuteBashCommand(toolUse, workingDir, claudeDir, opts,
 			conversationID)
 	default:
 		return ContentBlock{}, fmt.Errorf("unknown tool: %s",
@@ -107,14 +109,14 @@ func executeTool(toolUse ContentBlock, workingDir string,
 	}
 }
 
-func executeReadFile(toolUse ContentBlock, workingDir string,
-	opts *options, conversationID string,
+func ExecuteReadFile(toolUse ContentBlock, workingDir string, claudeDir string,
+	opts *Options, conversationID string,
 ) (ContentBlock, error) {
 	startTime := time.Now()
 
 	path, ok := toolUse.Input["path"].(string)
 	if !ok {
-		logAuditEntry("read_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "read_file", toolUse.Input, map[string]interface{}{
 			"error": "path must be a string",
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, "path must be a string")
@@ -122,25 +124,25 @@ func executeReadFile(toolUse ContentBlock, workingDir string,
 
 	if !isSafePath(path, workingDir) {
 		errMsg := fmt.Sprintf("path outside project: %s", path)
-		logAuditEntry("read_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "read_file", toolUse.Input, map[string]interface{}{
 			"error": errMsg,
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, errMsg)
 	}
 
-	if opts.isVerbose() {
+	if opts.IsVerbose() {
 		fmt.Fprintf(os.Stderr, "Tool: read_file(%s)\n", path)
 	}
 
 	content, err := os.ReadFile(path)
 	if err != nil {
-		logAuditEntry("read_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "read_file", toolUse.Input, map[string]interface{}{
 			"error": err.Error(),
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, err.Error())
 	}
 
-	logAuditEntry("read_file", toolUse.Input, map[string]interface{}{
+	logAuditEntry(claudeDir, "read_file", toolUse.Input, map[string]interface{}{
 		"success": true,
 		"path":    path,
 		"size":    len(content),
@@ -153,14 +155,14 @@ func executeReadFile(toolUse ContentBlock, workingDir string,
 	}, nil
 }
 
-func executeWriteFile(toolUse ContentBlock, workingDir string,
-	opts *options, conversationID string,
+func ExecuteWriteFile(toolUse ContentBlock, workingDir string, claudeDir string,
+	opts *Options, conversationID string,
 ) (ContentBlock, error) {
 	startTime := time.Now()
 
 	path, ok := toolUse.Input["path"].(string)
 	if !ok {
-		logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 			"error": "path must be a string",
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, "path must be a string")
@@ -168,7 +170,7 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 
 	content, ok := toolUse.Input["content"].(string)
 	if !ok {
-		logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 			"error": "content must be a string",
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, "content must be a string")
@@ -176,7 +178,7 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 
 	if !isSafePath(path, workingDir) {
 		errMsg := fmt.Sprintf("path outside project: %s", path)
-		logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 			"error": errMsg,
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, errMsg)
@@ -185,14 +187,14 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 	old, _ := os.ReadFile(path)
 
 	// Only show diff in normal/verbose mode
-	if !opts.isSilent() {
-		ToolHeader(path, !opts.canExecuteWrite())
+	if !opts.IsSilent() {
+		ToolHeader(path, !opts.CanExecuteWrite())
 		ShowDiff(string(old), content)
 	}
 
-	if !opts.canExecuteWrite() {
+	if !opts.CanExecuteWrite() {
 		fmt.Fprintf(os.Stderr, "(dry-run: use --tool=write to apply)\n\n")
-		logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 			"dry_run": true,
 			"path":    path,
 			"size":    len(content),
@@ -205,18 +207,18 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 		}, nil
 	}
 
-	if opts.isVerbose() {
+	if opts.IsVerbose() {
 		fmt.Fprintf(os.Stderr, "Tool: write_file(%s)\n", path)
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 			"error": err.Error(),
 		}, false, conversationID, startTime, false)
 		return makeToolError(toolUse.ID, err.Error())
 	}
 
-	logAuditEntry("write_file", toolUse.Input, map[string]interface{}{
+	logAuditEntry(claudeDir, "write_file", toolUse.Input, map[string]interface{}{
 		"success": true,
 		"path":    path,
 		"size":    len(content),
@@ -229,43 +231,43 @@ func executeWriteFile(toolUse ContentBlock, workingDir string,
 	}, nil
 }
 
-func executeBashCommand(toolUse ContentBlock, workingDir string,
-	opts *options, conversationID string,
+func ExecuteBashCommand(toolUse ContentBlock, workingDir string, claudeDir string,
+	opts *Options, conversationID string,
 ) (ContentBlock, error) {
 	startTime := time.Now()
 
 	command, ok := toolUse.Input["command"].(string)
 	if !ok {
-		return logAndReturnError(toolUse.ID, "bash_command",
+		return logAndReturnError(toolUse.ID, claudeDir, "bash_command",
 			toolUse.Input, "command must be a string",
 			conversationID, startTime)
 	}
 
 	reason, ok := toolUse.Input["reason"].(string)
 	if !ok {
-		return logAndReturnError(toolUse.ID, "bash_command",
+		return logAndReturnError(toolUse.ID, claudeDir, "bash_command",
 			toolUse.Input, "reason must be a string",
 			conversationID, startTime)
 	}
 
 	// Validate command safety
-	if err := validateCommand(command); err != nil {
-		return logAndReturnError(toolUse.ID, "bash_command",
+	if err := ValidateCommand(command); err != nil {
+		return logAndReturnError(toolUse.ID, claudeDir, "bash_command",
 			toolUse.Input, err.Error(), conversationID, startTime)
 	}
 
 	// Dry-run mode: show what would execute
-	if !opts.canExecuteCommand() {
+	if !opts.CanExecuteCommand() {
 		msg := fmt.Sprintf(
 			"Dry-run: would execute command: %s\nReason: %s\n"+
 				"Use --tool=command or --tool=all to execute",
 			command, reason)
-		if !opts.isSilent() {
+		if !opts.IsSilent() {
 			ToolHeader("bash_command", true)
 		}
 		fmt.Fprintf(os.Stderr, "%s\n\n", msg)
 
-		logAuditEntry("bash_command", toolUse.Input, map[string]interface{}{
+		logAuditEntry(claudeDir, "bash_command", toolUse.Input, map[string]interface{}{
 			"dry_run": true,
 			"command": command,
 			"reason":  reason,
@@ -278,13 +280,13 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 		}, nil
 	}
 
-	if opts.isVerbose() {
+	if opts.IsVerbose() {
 		fmt.Fprintf(os.Stderr, "Tool: bash_command(%q)\n", command)
 	}
 
 	// Execute command with timeout
 	ctx, cancel := context.WithTimeout(context.Background(),
-		bashCommandTimeout)
+		BashCommandTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
@@ -304,9 +306,9 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 		} else if ctx.Err() == context.DeadlineExceeded {
 			msg := fmt.Sprintf(
 				"Command timeout after %v\nStdout: %s\nStderr: %s",
-				bashCommandTimeout, stdout.String(), stderr.String())
+				BashCommandTimeout, stdout.String(), stderr.String())
 
-			logAuditEntry("bash_command", toolUse.Input, map[string]interface{}{
+			logAuditEntry(claudeDir, "bash_command", toolUse.Input, map[string]interface{}{
 				"error":     "timeout",
 				"exit_code": -1,
 				"stdout":    stdout.String(),
@@ -323,7 +325,7 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 		"Exit code: %d\nDuration: %v\nStdout:\n%s\nStderr:\n%s",
 		exitCode, duration, stdout.String(), stderr.String())
 
-	logAuditEntry("bash_command", toolUse.Input, map[string]interface{}{
+	logAuditEntry(claudeDir, "bash_command", toolUse.Input, map[string]interface{}{
 		"exit_code": exitCode,
 		"stdout":    stdout.String(),
 		"stderr":    stderr.String(),
@@ -341,7 +343,7 @@ func executeBashCommand(toolUse ContentBlock, workingDir string,
 	}, nil
 }
 
-func validateCommand(command string) error {
+func ValidateCommand(command string) error {
 	// Check for command chaining operators first (highest priority)
 	// These allow bypassing other protections
 	chainOperators := []string{"||", "&&", ";"}
@@ -425,22 +427,22 @@ func makeToolError(toolUseID, errMsg string) (ContentBlock, error) {
 	}, nil
 }
 
-func logAndReturnError(toolUseID, tool string,
+func logAndReturnError(toolUseID, claudeDir, tool string,
 	input map[string]interface{}, errMsg string,
 	conversationID string, startTime time.Time,
 ) (ContentBlock, error) {
-	logAuditEntry(tool, input, map[string]interface{}{
+	logAuditEntry(claudeDir, tool, input, map[string]interface{}{
 		"error": errMsg,
 	}, false, conversationID, startTime, false)
 	return makeToolError(toolUseID, errMsg)
 }
 
-func logAuditEntry(tool string, input, result map[string]interface{},
+func logAuditEntry(claudeDir, tool string, input, result map[string]interface{},
 	success bool, conversationID string, startTime time.Time, dryRun bool,
 ) {
 	duration := time.Since(startTime).Milliseconds()
 
-	entry := AuditLogEntry{
+	entry := storage.AuditLogEntry{
 		Timestamp:      time.Now().Format("20060102_150405"),
 		Tool:           tool,
 		Input:          input,
@@ -458,20 +460,20 @@ func logAuditEntry(tool string, input, result map[string]interface{},
 	}
 
 	// Log to audit file (best effort, don't fail tool execution)
-	if err := appendAuditLog(entry); err != nil {
+	if err := storage.AppendAuditLog(claudeDir, entry); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write audit log: %v\n",
 			err)
 	}
 }
 
-// executeTools processes all tool use requests in the response.
-func executeTools(content []ContentBlock, workingDir string,
-	opts *options, conversationID string,
+// ExecuteTools processes all tool use requests in the response.
+func ExecuteTools(content []ContentBlock, workingDir string, claudeDir string,
+	opts *Options, conversationID string,
 ) ([]ContentBlock, error) {
 	results := []ContentBlock{}
 	for _, block := range content {
 		if block.Type == "tool_use" {
-			result, err := executeTool(block, workingDir, opts,
+			result, err := ExecuteTool(block, workingDir, claudeDir, opts,
 				conversationID)
 			if err != nil {
 				return nil, fmt.Errorf("tool error: %w", err)

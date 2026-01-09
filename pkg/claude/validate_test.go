@@ -1,20 +1,22 @@
-package main
+package claude_test
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/marcopeereboom/go-claude/pkg/claude"
 )
 
 // TestValidateCommandSimple - minimal test to isolate the issue
 func TestValidateCommandSimple(t *testing.T) {
 	cmd := "ls && rm file.txt"
-	err := validateCommand(cmd)
+	err := claude.ValidateCommand(cmd)
 	
 	t.Logf("Command: %q", cmd)
 	t.Logf("Error: %v", err)
 	
 	if err == nil {
-		t.Fatal("validateCommand() returned nil, expected error")
+		t.Fatal("ValidateCommand() returned nil, expected error")
 	}
 	
 	errStr := err.Error()
@@ -32,13 +34,13 @@ func TestValidateCommandSimple(t *testing.T) {
 // TestValidateCommandOr - test || blocking
 func TestValidateCommandOr(t *testing.T) {
 	cmd := "ls || echo fail"
-	err := validateCommand(cmd)
+	err := claude.ValidateCommand(cmd)
 	
 	t.Logf("Command: %q", cmd)
 	t.Logf("Error: %v", err)
 	
 	if err == nil {
-		t.Fatal("validateCommand() returned nil, expected error")
+		t.Fatal("ValidateCommand() returned nil, expected error")
 	}
 	
 	if !strings.Contains(err.Error(), "||") {

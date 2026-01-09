@@ -1,15 +1,17 @@
-package main
+package claude_test
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/marcopeereboom/go-claude/pkg/claude"
 )
 
 func TestEstimateCost(t *testing.T) {
-	messages := []MessageContent{
+	messages := []claude.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: strings.Repeat("a", 4000)},
 			},
 		},
@@ -18,7 +20,7 @@ func TestEstimateCost(t *testing.T) {
 	userMsg := strings.Repeat("b", 2000)
 	model := "claude-sonnet-4-5-20250929"
 
-	estimate := estimateCost(userMsg, messages, model)
+	estimate := claude.EstimateCost(userMsg, messages, model)
 
 	// Check ballpark (rough heuristic)
 	if estimate.InputTokens < 1000 || estimate.InputTokens > 3000 {
@@ -31,30 +33,30 @@ func TestEstimateCost(t *testing.T) {
 }
 
 func TestGetLastUserMessage(t *testing.T) {
-	messages := []MessageContent{
+	messages := []claude.MessageContent{
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: "first message"},
 			},
 		},
 		{
 			Role: "assistant",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: "response"},
 			},
 		},
 		{
 			Role: "user",
-			Content: []ContentBlock{
+			Content: []claude.ContentBlock{
 				{Type: "text", Text: "second message"},
 			},
 		},
 	}
 
-	msg, err := getLastUserMessage(messages)
+	msg, err := claude.GetLastUserMessage(messages)
 	if err != nil {
-		t.Fatalf("getLastUserMessage failed: %v", err)
+		t.Fatalf("GetLastUserMessage failed: %v", err)
 	}
 
 	if msg != "second message" {
@@ -63,9 +65,9 @@ func TestGetLastUserMessage(t *testing.T) {
 }
 
 func TestGetLastUserMessage_Empty(t *testing.T) {
-	messages := []MessageContent{}
+	messages := []claude.MessageContent{}
 
-	_, err := getLastUserMessage(messages)
+	_, err := claude.GetLastUserMessage(messages)
 	if err == nil {
 		t.Error("expected error for empty messages")
 	}
@@ -85,7 +87,7 @@ func TestGetModelPricing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
-			pricing := getModelPricing(tt.model)
+			pricing := claude.GetModelPricing(tt.model)
 			if pricing.InputPerMillion != tt.expectedInput {
 				t.Errorf("input: got %.2f, want %.2f", pricing.InputPerMillion, tt.expectedInput)
 			}

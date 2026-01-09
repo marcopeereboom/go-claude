@@ -1,4 +1,4 @@
-package main
+package claude
 
 import (
 	"os"
@@ -17,7 +17,7 @@ var (
 	Info           = display.Info
 )
 
-// isTTY detects if output is going to a terminal (not a file/pipe)
-func isTTY(f *os.File) bool {
+// IsTTY detects if output is going to a terminal (not a file/pipe)
+func IsTTY(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }

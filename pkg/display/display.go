@@ -14,7 +14,7 @@ import (
 // display.go - Terminal output formatting and syntax highlighting
 //
 // CRITICAL: This file ONLY handles terminal display. It NEVER writes files.
-// All functions that colorize check isTTY and return plain text if false.
+// All functions that colorize check IsTTY and return plain text if false.
 //
 // Separation of concerns:
 // - display.go: Format output for humans (terminal)
@@ -33,8 +33,8 @@ const (
 	colorBold   = "\033[1m"
 )
 
-// isTTY detects if output is going to a terminal (not a file/pipe)
-func isTTY(f *os.File) bool {
+// IsTTY detects if output is going to a terminal (not a file/pipe)
+func IsTTY(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
@@ -42,7 +42,7 @@ func isTTY(f *os.File) bool {
 // Adds git-style colors if stderr is a TTY.
 // Never modifies the actual content - only display formatting.
 func ShowDiff(old, new string) {
-	usesColor := isTTY(os.Stderr)
+	usesColor := IsTTY(os.Stderr)
 	diff := generateUnifiedDiff(old, new)
 
 	// Print line by line with optional coloring
@@ -193,7 +193,7 @@ func printColoredDiffLine(line string) {
 // Uses chroma for syntax highlighting if output is a TTY.
 // Never modifies actual content - only display layer.
 func FormatResponse(w io.Writer, content string) {
-	if !isTTY(os.Stdout) {
+	if !IsTTY(os.Stdout) {
 		// Not a TTY - write plain text (e.g., piped to file)
 		fmt.Fprint(w, content)
 		return
@@ -319,7 +319,7 @@ func formatMarkdownLine(w io.Writer, line string) {
 
 // ToolHeader prints a styled tool execution header to stderr
 func ToolHeader(name string, dryRun bool) {
-	if !isTTY(os.Stderr) {
+	if !IsTTY(os.Stderr) {
 		if dryRun {
 			fmt.Fprintf(os.Stderr, "\n=== %s (dry-run) ===\n", name)
 		} else {
@@ -340,7 +340,7 @@ func ToolHeader(name string, dryRun bool) {
 
 // ToolResult prints a styled tool execution result to stderr
 func ToolResult(success bool, message string) {
-	if !isTTY(os.Stderr) {
+	if !IsTTY(os.Stderr) {
 		fmt.Fprintln(os.Stderr, message)
 		return
 	}
@@ -357,7 +357,7 @@ func ToolResult(success bool, message string) {
 // Warning prints a warning message to stderr
 func Warning(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	if !isTTY(os.Stderr) {
+	if !IsTTY(os.Stderr) {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
 		return
 	}
@@ -368,7 +368,7 @@ func Warning(format string, args ...interface{}) {
 
 // Info prints an informational message to stderr
 func Info(format string, args ...interface{}) {
-	if !isTTY(os.Stderr) {
+	if !IsTTY(os.Stderr) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 		return
 	}
