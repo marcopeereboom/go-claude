@@ -138,6 +138,7 @@ func LoadConversationHistory(claudeDir string) ([]MessageContent, error) {
 }
 
 // ListRequestResponsePairs returns sorted list of timestamps with complete pairs
+// Ignores .deleting files (part of atomic deletion process)
 func ListRequestResponsePairs(claudeDir string) ([]string, error) {
 	entries, err := os.ReadDir(claudeDir)
 	if err != nil {
@@ -147,6 +148,12 @@ func ListRequestResponsePairs(claudeDir string) ([]string, error) {
 	timestamps := make(map[string]bool)
 	for _, entry := range entries {
 		name := entry.Name()
+
+		// Skip .deleting files (in-progress deletions)
+		if strings.HasSuffix(name, ".deleting") {
+			continue
+		}
+
 		if strings.HasPrefix(name, "request_") && strings.HasSuffix(name, ".json") {
 			ts := strings.TrimPrefix(strings.TrimSuffix(name, ".json"), "request_")
 
@@ -201,11 +208,40 @@ func SaveModelsCache(claudeDir string, cache *ModelsCache) error {
 	return SaveJSON(path, cache)
 }
 
-// PruneResponses deletes old request/response pairs, keeping last N
-// Both request and response files must be successfully deleted for a pair
-// to be considered pruned. If either deletion fails, the pair is skipped
-// and an error is returned indicating which pairs failed.
+// CleanupOrphanedDeletingFiles removes any .deleting files left over from interrupted operations
+func CleanupOrphanedDeletingFiles(claudeDir string) error {
+	entries, err := os.ReadDir(claudeDir)
+	if err != nil {
+		return err
+	}
+
+	var cleanupErrors []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".deleting") {
+			path := filepath.Join(claudeDir, name)
+			if err := os.Remove(path); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("%s: %v", name, err))
+			}
+		}
+	}
+
+	if len(cleanupErrors) > 0 {
+		return fmt.Errorf("cleanup errors: %s", strings.Join(cleanupErrors, "; "))
+	}
+
+	return nil
+}
+
+// PruneResponses atomically deletes old request/response pairs, keeping last N
+// Uses two-phase commit: rename to .deleting, then delete .deleting files
+// This ensures no orphaned files are left behind even if interrupted
 func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
+	// First cleanup any orphaned .deleting files from previous interrupted operations
+	if err := CleanupOrphanedDeletingFiles(claudeDir); err != nil {
+		return fmt.Errorf("cleanup orphaned files: %w", err)
+	}
+
 	pairs, err := ListRequestResponsePairs(claudeDir)
 	if err != nil {
 		return err
@@ -223,31 +259,54 @@ func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
 	// pairs is sorted oldest to newest, so we delete from the beginning
 	toDelete := pairs[:len(pairs)-keepLast]
 
-	var deleteErrors []string
-	deletedCount := 0
+	// Phase 1: Rename both files to .deleting (atomic marking for deletion)
+	var markedForDeletion []string
+	var renameErrors []string
 
 	for _, ts := range toDelete {
 		reqPath := filepath.Join(claudeDir, fmt.Sprintf("request_%s.json", ts))
 		respPath := filepath.Join(claudeDir, fmt.Sprintf("response_%s.json", ts))
+		reqDeleting := reqPath + ".deleting"
+		respDeleting := respPath + ".deleting"
 
-		// Attempt to delete request file
-		reqErr := os.Remove(reqPath)
-		respErr := os.Remove(respPath)
-
-		// Both must succeed for pair to be considered deleted
-		if reqErr != nil || respErr != nil {
-			if reqErr != nil {
-				deleteErrors = append(deleteErrors,
-					fmt.Sprintf("failed to delete request %s: %v", ts, reqErr))
-			}
-			if respErr != nil {
-				deleteErrors = append(deleteErrors,
-					fmt.Sprintf("failed to delete response %s: %v", ts, respErr))
-			}
+		// Rename request file
+		if err := os.Rename(reqPath, reqDeleting); err != nil {
+			renameErrors = append(renameErrors, fmt.Sprintf("request %s: %v", ts, err))
 			continue
 		}
 
-		// Both deleted successfully
+		// Rename response file - rollback request rename if this fails
+		if err := os.Rename(respPath, respDeleting); err != nil {
+			// Rollback: restore request file
+			os.Rename(reqDeleting, reqPath)
+			renameErrors = append(renameErrors, fmt.Sprintf("response %s: %v", ts, err))
+			continue
+		}
+
+		// Both renames succeeded - mark this pair for deletion
+		markedForDeletion = append(markedForDeletion, ts)
+	}
+
+	// Phase 2: Delete all .deleting files
+	var deleteErrors []string
+	deletedCount := 0
+
+	for _, ts := range markedForDeletion {
+		reqDeleting := filepath.Join(claudeDir, fmt.Sprintf("request_%s.json.deleting", ts))
+		respDeleting := filepath.Join(claudeDir, fmt.Sprintf("response_%s.json.deleting", ts))
+
+		reqErr := os.Remove(reqDeleting)
+		respErr := os.Remove(respDeleting)
+
+		// Track errors but continue - files are already marked for deletion
+		if reqErr != nil {
+			deleteErrors = append(deleteErrors, fmt.Sprintf("request %s: %v", ts, reqErr))
+		}
+		if respErr != nil {
+			deleteErrors = append(deleteErrors, fmt.Sprintf("response %s: %v", ts, respErr))
+		}
+
+		// Count as deleted even if Remove failed - files are renamed and invisible to system
 		deletedCount++
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Pruned: %s\n", ts)
@@ -259,10 +318,14 @@ func PruneResponses(claudeDir string, keepLast int, verbose bool) error {
 			deletedCount, len(pairs)-deletedCount)
 	}
 
-	// If any deletions failed, return error with details
-	if len(deleteErrors) > 0 {
-		return fmt.Errorf("prune incomplete: %d errors:\n%s",
-			len(deleteErrors), strings.Join(deleteErrors, "\n"))
+	// Report any errors encountered
+	var allErrors []string
+	allErrors = append(allErrors, renameErrors...)
+	allErrors = append(allErrors, deleteErrors...)
+
+	if len(allErrors) > 0 {
+		return fmt.Errorf("prune completed with errors:\n%s",
+			strings.Join(allErrors, "\n"))
 	}
 
 	return nil

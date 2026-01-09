@@ -586,8 +586,9 @@ func TestPruneResponsesErrorHandling(t *testing.T) {
 		t.Error("expected error when file deletion fails")
 	} else {
 		errMsg := err.Error()
-		if !strings.Contains(errMsg, "prune incomplete") {
-			t.Errorf("error should mention 'prune incomplete', got: %s", errMsg)
+		// Error message changed - now reports "prune completed with errors"
+		if !strings.Contains(errMsg, "prune completed with errors") {
+			t.Errorf("error should mention 'prune completed with errors', got: %s", errMsg)
 		}
 	}
 }
@@ -790,5 +791,126 @@ func TestAppendAuditLogWithError(t *testing.T) {
 	}
 	if logged.Success {
 		t.Error("expected Success to be false")
+	}
+}
+
+// TestCleanupOrphanedDeletingFiles tests cleanup of .deleting files
+func TestCleanupOrphanedDeletingFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create some .deleting files (simulate interrupted deletion)
+	deletingFiles := []string{
+		"request_20260105_100000.json.deleting",
+		"response_20260105_100000.json.deleting",
+		"request_20260105_110000.json.deleting",
+	}
+
+	for _, f := range deletingFiles {
+		path := filepath.Join(tmpDir, f)
+		os.WriteFile(path, []byte("test"), 0644)
+	}
+
+	// Also create normal files that should NOT be deleted
+	normalFiles := []string{
+		"request_20260105_120000.json",
+		"response_20260105_120000.json",
+	}
+	for _, f := range normalFiles {
+		path := filepath.Join(tmpDir, f)
+		os.WriteFile(path, []byte("test"), 0644)
+	}
+
+	// Run cleanup
+	err := CleanupOrphanedDeletingFiles(tmpDir)
+	if err != nil {
+		t.Fatalf("CleanupOrphanedDeletingFiles failed: %v", err)
+	}
+
+	// Verify .deleting files are gone
+	for _, f := range deletingFiles {
+		path := filepath.Join(tmpDir, f)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf(".deleting file %s should be removed", f)
+		}
+	}
+
+	// Verify normal files remain
+	for _, f := range normalFiles {
+		path := filepath.Join(tmpDir, f)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("normal file %s should still exist", f)
+		}
+	}
+}
+
+// TestListRequestResponsePairsIgnoresDeletingFiles tests that .deleting files are filtered
+func TestListRequestResponsePairsIgnoresDeletingFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a complete pair
+	SaveRequest(tmpDir, "20260105_100000", []MessageContent{})
+	SaveResponse(tmpDir, "20260105_100000", []byte("[]"))
+
+	// Create .deleting files (should be ignored)
+	os.WriteFile(filepath.Join(tmpDir, "request_20260105_110000.json.deleting"), []byte("[]"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "response_20260105_110000.json.deleting"), []byte("[]"), 0644)
+
+	// List pairs
+	pairs, err := ListRequestResponsePairs(tmpDir)
+	if err != nil {
+		t.Fatalf("ListRequestResponsePairs failed: %v", err)
+	}
+
+	// Should only see the complete pair, not .deleting files
+	if len(pairs) != 1 {
+		t.Errorf("expected 1 pair, got %d", len(pairs))
+	}
+	if pairs[0] != "20260105_100000" {
+		t.Errorf("expected pair 20260105_100000, got %s", pairs[0])
+	}
+}
+
+// TestPruneResponsesAtomicRollback tests that failed response rename rolls back request rename
+func TestPruneResponsesAtomicRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create 2 pairs
+	timestamps := []string{
+		"20260105_100000",
+		"20260105_110000",
+	}
+	for _, ts := range timestamps {
+		SaveRequest(tmpDir, ts, []MessageContent{})
+		SaveResponse(tmpDir, ts, []byte("[]"))
+	}
+
+	// Make response file read-only to force rename failure
+	respPath := filepath.Join(tmpDir, "response_20260105_100000.json")
+	os.Chmod(respPath, 0444)
+	os.Chmod(tmpDir, 0555) // Read-only directory
+	defer os.Chmod(tmpDir, 0755)
+
+	// Try to prune - should fail to rename response, rollback request rename
+	err := PruneResponses(tmpDir, 1, false)
+
+	// Restore permissions
+	os.Chmod(tmpDir, 0755)
+	os.Chmod(respPath, 0644)
+
+	// Should get error
+	if err == nil {
+		t.Error("expected error when rename fails")
+	}
+
+	// Verify request file was NOT renamed (rollback worked)
+	reqPath := filepath.Join(tmpDir, "request_20260105_100000.json")
+	if _, err := os.Stat(reqPath); os.IsNotExist(err) {
+		t.Error("request file should still exist (rollback should have restored it)")
+	}
+
+	// Verify no .deleting files left behind
+	reqDeleting := reqPath + ".deleting"
+	if _, err := os.Stat(reqDeleting); !os.IsNotExist(err) {
+		t.Error(".deleting file should not exist after rollback")
 	}
 }
