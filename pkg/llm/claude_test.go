@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// Test helper types to match Claude API response structure
+type claudeResponse struct {
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Role       string         `json:"role"`
+	Content    []ContentBlock `json:"content"`
+	Model      string         `json:"model"`
+	StopReason string         `json:"stop_reason"`
+	Usage      Usage          `json:"usage"`
+}
+
 // mockClaudeServer creates a test HTTP server that simulates Claude API
 func mockClaudeServer(t *testing.T, responses []claudeResponse) *httptest.Server {
 	callCount := 0
@@ -16,7 +27,7 @@ func mockClaudeServer(t *testing.T, responses []claudeResponse) *httptest.Server
 	return httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			// Verify request headers
-			if r.Header.Get("anthropic-version") != apiVersion {
+			if r.Header.Get("anthropic-version") != claudeAPIVersion {
 				t.Errorf("wrong API version header: got %s", r.Header.Get("anthropic-version"))
 			}
 			if r.Header.Get("x-api-key") == "" {
@@ -187,7 +198,7 @@ func TestClaudeGenerate_Errors(t *testing.T) {
 			name:       "unauthorized",
 			statusCode: http.StatusUnauthorized,
 			response:   map[string]interface{}{},
-			wantErr:    "check API key",
+			wantErr:    "API error 401",
 		},
 	}
 
@@ -264,12 +275,6 @@ func TestClaudeGenerate_ContextCancel(t *testing.T) {
 }
 
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && 
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr || 
-		len(s) > len(substr)+1 && hasSubstring(s, substr)))
-}
-
-func hasSubstring(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
 			return true

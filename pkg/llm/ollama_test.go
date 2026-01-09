@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+// Test helper types to match Ollama API response structure
+type ollamaMessage struct {
+	Role    string                   `json:"role"`
+	Content string                   `json:"content"`
+	Tools   []map[string]interface{} `json:"tool_calls,omitempty"`
+}
+
+type ollamaResponse struct {
+	Model     string        `json:"model"`
+	CreatedAt string        `json:"created_at"`
+	Message   ollamaMessage `json:"message"`
+	Done      bool          `json:"done"`
+}
+
 // mockOllamaServer creates a test HTTP server that simulates Ollama API
 func mockOllamaServer(t *testing.T, responses []ollamaResponse) *httptest.Server {
 	callCount := 0
@@ -160,8 +174,9 @@ func TestOllamaGenerate_ToolUse(t *testing.T) {
 	if block.Name != "read_file" {
 		t.Errorf("expected read_file, got %s", block.Name)
 	}
-	if block.ID != "call_123" {
-		t.Errorf("expected call_123, got %s", block.ID)
+	// Ollama generates IDs as call_{function_name}
+	if block.ID != "call_read_file" {
+		t.Errorf("expected call_read_file, got %s", block.ID)
 	}
 
 	if block.Input["path"] != "test.txt" {
