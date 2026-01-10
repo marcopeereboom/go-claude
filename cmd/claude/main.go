@@ -222,6 +222,9 @@ func toClaudeOptions(opts *options) *claude.Options {
 		PruneOld:       opts.pruneOld,
 		Estimate:       opts.estimate,
 		Execute:        opts.execute,
+		PreferLocal:    opts.preferLocal,
+		AllowFallback:  opts.allowFallback,
+		MaxClaudeRatio: opts.maxClaudeRatio,
 	}
 }
 
@@ -241,6 +244,8 @@ func parseFlags() *options {
 		fmt.Fprintf(os.Stderr, "  claude --replay=20260104_153022 --tool=all\n\n")
 		fmt.Fprintf(os.Stderr, "  # Show statistics\n")
 		fmt.Fprintf(os.Stderr, "  claude --stats\n\n")
+		fmt.Fprintf(os.Stderr, "  # Use local Ollama with fallback to Claude\n")
+		fmt.Fprintf(os.Stderr, "  echo \"explain this code\" | claude --prefer-local --allow-fallback\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
@@ -284,6 +289,14 @@ func parseFlags() *options {
 	flag.StringVar(&opts.ollamaURL, "ollama-url", claude.DefaultOllamaURL,
 		"Ollama API URL")
 
+	// Smart routing
+	flag.BoolVar(&opts.preferLocal, "prefer-local", true,
+		"prefer local Ollama models when possible (default: true)")
+	flag.BoolVar(&opts.allowFallback, "allow-fallback", true,
+		"allow fallback to Claude if Ollama fails (default: true)")
+	flag.Float64Var(&opts.maxClaudeRatio, "max-claude-ratio", 0.10,
+		"maximum ratio of Claude vs total requests (0.0-1.0, default: 0.10 = 10%)")
+
 	// Behavior
 	flag.StringVar(&opts.verbosity, "verbosity", claude.DefaultVerbosity,
 		"output verbosity: silent, normal, verbose, debug")
@@ -323,6 +336,18 @@ func showStats(claudeDir string) error {
 	fmt.Fprintf(os.Stderr, "Conversation turns: %d\n", len(pairs))
 	fmt.Fprintf(os.Stderr, "First run: %s\n", cfg.FirstRun)
 	fmt.Fprintf(os.Stderr, "Last run: %s\n", cfg.LastRun)
+
+	// Show provider stats
+	claudeReqs := cfg.ClaudeStats.RequestCount
+	ollamaReqs := cfg.OllamaStats.RequestCount
+	totalReqs := claudeReqs + ollamaReqs
+	if totalReqs > 0 {
+		claudePct := float64(claudeReqs) / float64(totalReqs) * 100
+		ollamaPct := float64(ollamaReqs) / float64(totalReqs) * 100
+		fmt.Fprintf(os.Stderr, "\nProvider usage:\n")
+		fmt.Fprintf(os.Stderr, "  Claude: %d requests (%.1f%%)\n", claudeReqs, claudePct)
+		fmt.Fprintf(os.Stderr, "  Ollama: %d requests (%.1f%%)\n", ollamaReqs, ollamaPct)
+	}
 
 	return nil
 }
@@ -421,6 +446,9 @@ type options struct {
 	pruneOld       int
 	estimate       bool
 	execute        bool
+	preferLocal    bool
+	allowFallback  bool
+	maxClaudeRatio float64
 }
 
 func (o *options) isVerbose() bool {

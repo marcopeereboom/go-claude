@@ -102,12 +102,22 @@ func TestFallbackFromOllamaToClaudeOnFailure(t *testing.T) {
 	}
 }
 
-func TestFallbackDisabledByDefault(t *testing.T) {
+func TestFallbackEnabledByDefault(t *testing.T) {
 	opts := claude.NewOptions()
 
-	// Verify fallback is disabled by default
-	if opts.AllowFallback {
-		t.Error("Expected AllowFallback to be false by default")
+	// Verify fallback is enabled by default (changed in Task 6)
+	if !opts.AllowFallback {
+		t.Error("Expected AllowFallback to be true by default")
+	}
+
+	// Verify prefer-local is enabled by default
+	if !opts.PreferLocal {
+		t.Error("Expected PreferLocal to be true by default")
+	}
+
+	// Verify max claude ratio is 10% by default
+	if opts.MaxClaudeRatio != 0.10 {
+		t.Errorf("Expected MaxClaudeRatio to be 0.10 by default, got %.2f", opts.MaxClaudeRatio)
 	}
 
 	if opts.FallbackModel != "" {

@@ -45,6 +45,11 @@ const (
 
 	// Default Ollama URL
 	DefaultOllamaURL = "http://localhost:11434"
+
+	// Smart routing defaults
+	DefaultPreferLocal    = true
+	DefaultAllowFallback  = true
+	DefaultMaxClaudeRatio = 0.10 // 10%
 )
 
 // Type aliases for LLM interface types
@@ -100,8 +105,12 @@ type Options struct {
 	OutputFile    string
 	OllamaURL     string
 
-	// Fallback
-	AllowFallback bool
+	// Smart routing
+	PreferLocal    bool
+	AllowFallback  bool
+	MaxClaudeRatio float64
+
+	// Fallback (legacy)
 	FallbackModel string
 
 	// Behavior
@@ -113,19 +122,21 @@ type Options struct {
 // NewOptions creates a new Options with default values (for tests)
 func NewOptions() *Options {
 	return &Options{
-		Model:         DefaultModel,
-		MaxTokens:     DefaultMaxTokens,
-		MaxCost:       DefaultMaxCost,
-		MaxIterations: DefaultMaxIterations,
-		Timeout:       DefaultTimeout,
-		Truncate:      0,
-		OllamaURL:     DefaultOllamaURL,
-		Verbosity:     DefaultVerbosity,
-		Tool:          DefaultTool,
-		Output:        DefaultOutput,
-		Replay:        "NOREPLAY",
-		AllowFallback: false,
-		FallbackModel: "",
+		Model:          DefaultModel,
+		MaxTokens:      DefaultMaxTokens,
+		MaxCost:        DefaultMaxCost,
+		MaxIterations:  DefaultMaxIterations,
+		Timeout:        DefaultTimeout,
+		Truncate:       0,
+		OllamaURL:      DefaultOllamaURL,
+		Verbosity:      DefaultVerbosity,
+		Tool:           DefaultTool,
+		Output:         DefaultOutput,
+		Replay:         "NOREPLAY",
+		PreferLocal:    DefaultPreferLocal,
+		AllowFallback:  DefaultAllowFallback,
+		MaxClaudeRatio: DefaultMaxClaudeRatio,
+		FallbackModel:  "",
 	}
 }
 
