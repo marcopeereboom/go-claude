@@ -100,6 +100,10 @@ type Options struct {
 	OutputFile    string
 	OllamaURL     string
 
+	// Fallback
+	AllowFallback bool
+	FallbackModel string
+
 	// Behavior
 	Verbosity string
 	Tool      string
@@ -120,6 +124,8 @@ func NewOptions() *Options {
 		Tool:          DefaultTool,
 		Output:        DefaultOutput,
 		Replay:        "NOREPLAY",
+		AllowFallback: false,
+		FallbackModel: "",
 	}
 }
 
@@ -170,16 +176,18 @@ func (o *Options) WantsJSON() bool {
 
 // session holds all state needed for a conversation execution.
 type session struct {
-	opts       *Options
-	claudeDir  string
-	apiKey     string
-	config     *Config
-	model      string
-	sysPrompt  string
-	timestamp  string
-	workingDir string
-	client     *http.Client
-	llmClient  llm.LLM
+	opts         *Options
+	claudeDir    string
+	apiKey       string
+	config       *Config
+	model        string
+	sysPrompt    string
+	timestamp    string
+	workingDir   string
+	client       *http.Client
+	llmClient    llm.LLM
+	fallbackLLM  llm.LLM // fallback client (Claude) if primary fails
+	usedFallback bool    // track if we used fallback this session
 }
 
 // conversationResult holds the outcome of a conversation execution.

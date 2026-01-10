@@ -83,29 +83,43 @@ func InitSession(opts *Options, claudeDir, apiURL, defaultSystemPrompt string) (
 
 	// Detect LLM provider based on model name
 	var llmClient llm.LLM
+	var fallbackLLM llm.LLM
+
 	if strings.HasPrefix(selectedModel, "claude-") {
 		llmClient = llm.NewClaude(apiKey, apiURL)
 	} else {
 		llmClient = llm.NewOllama(selectedModel, opts.OllamaURL)
+
+		// Set up fallback to Claude if enabled
+		if opts.AllowFallback {
+			fallbackModel := opts.FallbackModel
+			if fallbackModel == "" {
+				fallbackModel = DefaultModel
+			}
+			fallbackLLM = llm.NewClaude(apiKey, apiURL)
+			if opts.IsVerbose() {
+				fmt.Fprintf(os.Stderr, "Fallback enabled: %s → %s\n",
+					selectedModel, fallbackModel)
+			}
+		}
 	}
 
 	return &session{
-		opts:       opts,
-		claudeDir:  claudeDir,
-		apiKey:     apiKey,
-		config:     cfg,
-		model:      selectedModel,
-		sysPrompt:  sysPrompt,
-		timestamp:  timestamp,
-		workingDir: workingDir,
-		client: &http.Client{
-			Timeout: time.Duration(opts.Timeout) * time.Second,
-		},
-		llmClient: llmClient,
+		opts:        opts,
+		claudeDir:   claudeDir,
+		apiKey:      apiKey,
+		config:      cfg,
+		model:       selectedModel,
+		sysPrompt:   sysPrompt,
+		timestamp:   timestamp,
+		workingDir:  workingDir,
+		client:      &http.Client{Timeout: time.Duration(opts.Timeout) * time.Second},
+		llmClient:   llmClient,
+		fallbackLLM: fallbackLLM,
 	}, nil
 }
 
-// ExecuteConversation runs the agentic loop with tool support.
+// ExecuteConversation runs the agentic loop with tool support and fallback.
 func ExecuteConversation(sess *session, userMsg string) (*conversationResult, error) {
 	// Load conversation history
 	messages, err := storage.LoadConversationHistory(sess.claudeDir)
@@ -135,11 +149,19 @@ func ExecuteConversation(sess *session, userMsg string) (*conversationResult, er
 		maxIter = 1000 // Effective unlimited
 	}
 
+	// Track which provider we're using
+	currentLLM := sess.llmClient
+	currentProvider := "ollama"
+	if strings.HasPrefix(sess.model, "claude-") {
+		currentProvider = "claude"
+	}
+	currentModel := sess.model
+
 	// Agentic loop: iterate until Claude is done or limits reached
 	for i := 0; i < maxIter; i++ {
 		// Call LLM via unified interface
 		req := &llm.Request{
-			Model:     sess.model,
+			Model:     currentModel,
 			Messages:  messages,
 			Tools:     GetTools(sess.opts),
 			MaxTokens: sess.opts.MaxTokens,
@@ -147,7 +169,28 @@ func ExecuteConversation(sess *session, userMsg string) (*conversationResult, er
 		}
 
 		ctx := context.Background()
-		llmResp, err := sess.llmClient.Generate(ctx, req)
+		llmResp, err := currentLLM.Generate(ctx, req)
+
+		// Handle fallback if primary LLM fails
+		if err != nil && sess.fallbackLLM != nil && !sess.usedFallback {
+			if sess.opts.IsVerbose() {
+				fmt.Fprintf(os.Stderr, "Primary LLM failed (%v), falling back to Claude\n", err)
+			}
+
+			// Switch to fallback
+			currentLLM = sess.fallbackLLM
+			currentProvider = "claude"
+			currentModel = sess.opts.FallbackModel
+			if currentModel == "" {
+				currentModel = DefaultModel
+			}
+			sess.usedFallback = true
+
+			// Retry with fallback
+			req.Model = currentModel
+			llmResp, err = currentLLM.Generate(ctx, req)
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("LLM API call failed: %w", err)
 		}
@@ -185,14 +228,16 @@ func ExecuteConversation(sess *session, userMsg string) (*conversationResult, er
 				iterationCost, sess.opts.MaxCost, i+1)
 		}
 
-		// Update token counts
+		// Update token counts and provider stats
 		sess.config.TotalInput += apiResp.Usage.InputTokens
 		sess.config.TotalOutput += apiResp.Usage.OutputTokens
+		storage.UpdateProviderStats(sess.config, currentProvider,
+			apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens)
 
 		if sess.opts.IsVerbose() {
 			fmt.Fprintf(os.Stderr,
-				"Iteration %d - Tokens: %d in, %d out (cost: $%.4f)\n",
-				i+1, apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
+				"Iteration %d (%s) - Tokens: %d in, %d out (cost: $%.4f)\n",
+				i+1, currentProvider, apiResp.Usage.InputTokens, apiResp.Usage.OutputTokens,
 				costIn+costOut)
 		}
 
