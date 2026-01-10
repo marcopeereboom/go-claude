@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/marcopeereboom/go-claude/pkg/claude"
@@ -19,8 +20,42 @@ import (
 //go:embed defaultprompt.txt
 var defaultSystemPrompt string
 
+//go:embed ollama_prompt.txt
+var ollamaSystemPrompt string
+
 // apiURL can be overridden in tests
 var apiURL = "https://api.anthropic.com/v1/messages"
+
+// Version information set at build time
+var (
+	Version   = "dev"      // Set via -ldflags "-X main.Version=v1.0.0"
+	Commit    = "unknown"  // Set via -ldflags "-X main.Commit=$(git rev-parse HEAD)"
+	BuildTime = "unknown"  // Set via -ldflags "-X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+)
+
+// GetVersionInfo returns formatted version information
+func GetVersionInfo() string {
+	info := fmt.Sprintf("go-claude %s", Version)
+	
+	if Commit != "unknown" {
+		if len(Commit) > 7 {
+			info += fmt.Sprintf(" (%s)", Commit[:7])
+		} else {
+			info += fmt.Sprintf(" (%s)", Commit)
+		}
+	}
+	
+	if BuildTime != "unknown" {
+		info += fmt.Sprintf(" built %s", BuildTime)
+	}
+
+	// Add Go version and build info if available
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		info += fmt.Sprintf(" (go %s)", buildInfo.GoVersion)
+	}
+	
+	return info
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -31,6 +66,12 @@ func main() {
 
 func run() error {
 	opts := parseFlags()
+
+	// Handle --version flag first
+	if opts.version {
+		fmt.Println(GetVersionInfo())
+		return nil
+	}
 
 	claudeDir, err := getClaudeDir(opts.resumeDir)
 	if err != nil {
@@ -181,8 +222,21 @@ func run() error {
 }
 
 func executeWithSavedInput(userMsg string, opts *options, claudeDir string) error {
+	// Choose system prompt based on model
+	systemPrompt := defaultSystemPrompt
+	
+	// Get model to determine LLM provider
+	configPath := filepath.Join(claudeDir, "config.json")
+	cfg := storage.LoadOrCreateConfig(configPath)
+	model := claude.SelectModel(opts.model, cfg.Model)
+	
+	// Use Ollama-specific prompt for non-Claude models
+	if !strings.HasPrefix(model, "claude-") {
+		systemPrompt = ollamaSystemPrompt
+	}
+
 	// Initialize session
-	sess, err := claude.InitSession(toClaudeOptions(opts), claudeDir, apiURL, defaultSystemPrompt)
+	sess, err := claude.InitSession(toClaudeOptions(opts), claudeDir, apiURL, systemPrompt)
 	if err != nil {
 		return err
 	}
@@ -249,6 +303,10 @@ func parseFlags() *options {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
+
+	// Version
+	flag.BoolVar(&opts.version, "version", false,
+		"show version information and exit")
 
 	// Modes
 	flag.BoolVar(&opts.modelsList, "models-list", false,
@@ -424,6 +482,7 @@ func resetConversation(claudeDir string, verbose bool) error {
 
 // options holds command-line options (local to cmd/claude)
 type options struct {
+	version        bool
 	model          string
 	maxTokens      int
 	maxCost        float64
