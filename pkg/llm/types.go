@@ -11,6 +11,16 @@ type ModelInfo struct {
 	Provider    string `json:"provider"` // "claude" or "ollama"
 }
 
+// ModelCapabilities describes what features a model supports.
+type ModelCapabilities struct {
+	SupportsTools       bool     // Can the model use function calling/tools?
+	SupportsVision      bool     // Can the model process images?
+	SupportsStreaming   bool     // Can the model stream responses?
+	MaxContextTokens    int      // Maximum context window size
+	Provider            string   // "claude" or "ollama"
+	RecommendedForTasks []string // e.g., ["code", "chat", "reasoning"]
+}
+
 // LLM is the interface that all LLM backends must implement.
 type LLM interface {
 	// Generate sends a request to the LLM and returns the response.
@@ -18,6 +28,9 @@ type LLM interface {
 
 	// ListModels returns all available models for this provider.
 	ListModels(ctx context.Context) ([]ModelInfo, error)
+
+	// GetCapabilities returns the capabilities of the current model.
+	GetCapabilities() ModelCapabilities
 }
 
 // Request contains all parameters needed for an LLM API call.

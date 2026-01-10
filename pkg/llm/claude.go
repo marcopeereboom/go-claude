@@ -29,6 +29,18 @@ func NewClaude(apiKey, baseURL string) *ClaudeClient {
 	}
 }
 
+// GetCapabilities returns the capabilities of Claude models.
+func (c *ClaudeClient) GetCapabilities() ModelCapabilities {
+	return ModelCapabilities{
+		SupportsTools:       true,
+		SupportsVision:      true,
+		SupportsStreaming:   true,
+		MaxContextTokens:    200000,
+		Provider:            "claude",
+		RecommendedForTasks: []string{"code", "reasoning", "analysis", "writing"},
+	}
+}
+
 // Generate sends a request to Claude API.
 func (c *ClaudeClient) Generate(ctx context.Context, req *Request) (*Response, error) {
 	// Convert to Claude API format

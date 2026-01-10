@@ -248,7 +248,7 @@ func TestOllamaGenerate_ContextCancel(t *testing.T) {
 
 	client := NewOllama("llama2", server.URL)
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	// Cancel immediately
 	cancel()
 

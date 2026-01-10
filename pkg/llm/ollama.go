@@ -26,6 +26,47 @@ func NewOllama(model, baseURL string) *OllamaClient {
 	}
 }
 
+// GetCapabilities returns the capabilities of the Ollama model.
+func (o *OllamaClient) GetCapabilities() ModelCapabilities {
+	// Detect capabilities based on model name
+	modelLower := strings.ToLower(o.model)
+	supportsTools := false
+	recommendedTasks := []string{"chat"}
+
+	// Models known to support tools
+	toolModels := []string{"llama3.1", "llama3.2", "qwen2.5", "mistral", "command-r"}
+	for _, tm := range toolModels {
+		if strings.Contains(modelLower, tm) {
+			supportsTools = true
+			break
+		}
+	}
+
+	// Detect specialized models
+	if strings.Contains(modelLower, "code") || strings.Contains(modelLower, "coder") {
+		recommendedTasks = []string{"code", "programming"}
+	} else if strings.Contains(modelLower, "embed") {
+		recommendedTasks = []string{"embeddings"}
+	}
+
+	// Context size varies by model, use conservative default
+	maxTokens := 8192
+	if strings.Contains(modelLower, "llama3.1") {
+		maxTokens = 128000
+	} else if strings.Contains(modelLower, "qwen2.5") {
+		maxTokens = 32768
+	}
+
+	return ModelCapabilities{
+		SupportsTools:       supportsTools,
+		SupportsVision:      false, // Most Ollama models don't support vision yet
+		SupportsStreaming:   true,
+		MaxContextTokens:    maxTokens,
+		Provider:            "ollama",
+		RecommendedForTasks: recommendedTasks,
+	}
+}
+
 // Generate sends a request to Ollama API.
 func (o *OllamaClient) Generate(ctx context.Context, req *Request) (*Response, error) {
 	// Convert messages to Ollama format
