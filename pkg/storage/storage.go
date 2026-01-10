@@ -40,6 +40,13 @@ type APIResponse struct {
 	Error      *APIError      `json:"error,omitempty"`
 }
 
+// ProviderStats tracks usage per provider
+type ProviderStats struct {
+	RequestCount int `json:"request_count"`
+	TokensInput  int `json:"tokens_input"`
+	TokensOutput int `json:"tokens_output"`
+}
+
 // Config stores aggregate stats and settings
 type Config struct {
 	Model        string `json:"model"`
@@ -48,6 +55,9 @@ type Config struct {
 	TotalOutput  int    `json:"total_output_tokens"`
 	FirstRun     string `json:"first_run"`
 	LastRun      string `json:"last_run"`
+	// Provider usage tracking for smart routing
+	ClaudeStats ProviderStats `json:"claude_stats"`
+	OllamaStats ProviderStats `json:"ollama_stats"`
 }
 
 // ModelsCache stores cached model listings from providers
@@ -226,6 +236,37 @@ func LoadModelsCache(claudeDir string) (*ModelsCache, error) {
 func SaveModelsCache(claudeDir string, cache *ModelsCache) error {
 	path := filepath.Join(claudeDir, "models.json")
 	return SaveJSON(path, cache)
+}
+
+// UpdateProviderStats updates usage statistics for a provider
+func UpdateProviderStats(cfg *Config, provider string, inputTokens, outputTokens int) {
+	switch provider {
+	case "claude":
+		cfg.ClaudeStats.RequestCount++
+		cfg.ClaudeStats.TokensInput += inputTokens
+		cfg.ClaudeStats.TokensOutput += outputTokens
+	case "ollama":
+		cfg.OllamaStats.RequestCount++
+		cfg.OllamaStats.TokensInput += inputTokens
+		cfg.OllamaStats.TokensOutput += outputTokens
+	}
+	// Also update totals for backwards compatibility
+	cfg.TotalInput += inputTokens
+	cfg.TotalOutput += outputTokens
+}
+
+// GetClaudeUsageRatio returns the ratio of Claude requests to total requests (0.0 to 1.0)
+func GetClaudeUsageRatio(cfg *Config) float64 {
+	totalRequests := cfg.ClaudeStats.RequestCount + cfg.OllamaStats.RequestCount
+	if totalRequests == 0 {
+		return 0.0
+	}
+	return float64(cfg.ClaudeStats.RequestCount) / float64(totalRequests)
+}
+
+// IsOverClaudeQuota checks if Claude usage exceeds the specified ratio threshold
+func IsOverClaudeQuota(cfg *Config, maxRatio float64) bool {
+	return GetClaudeUsageRatio(cfg) > maxRatio
 }
 
 // CleanupOrphanedDeletingFiles removes any .deleting files left over from interrupted operations
