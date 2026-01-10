@@ -1,6 +1,42 @@
 # go-claude Development Context
 
-**Last Updated:** 2026-01-05
+**Last Updated:** 2026-01-06
+
+## Recent Changes
+
+### Cost Estimation (2026-01-06)
+Added `--estimate` and `--execute` workflow for pre-flight cost checks.
+
+**New files:**
+- `cmd/claude/cost_estimation.go` - Token counting, pricing, display
+- `cmd/claude/cost_test.go` - Unit tests
+
+**Modified:**
+- `cmd/claude/claude.go` - Added estimate/execute modes in run()
+
+**Usage:**
+```bash
+echo "task" | claude --tool=all --estimate
+claude --execute --max-cost-override=0.05
+```
+
+**How it works:**
+- `--estimate` calculates tokens (4 chars/token), saves message, no API call
+- `--execute` loads last user message, executes it
+- `--max-cost-override` overrides max-cost for one run
+- Model-specific pricing: Sonnet ($3/$15), Opus ($15/$75), Haiku ($0.80/$4)
+
+**Implementation:**
+- Unpaired requests: --execute checks for request_*.json without response
+- Saves to conversation: --estimate writes request_TIMESTAMP.json
+- Reuses storage: no extra files, uses existing request/response pairs
+
+**Limitations:**
+- 4 chars/token heuristic (varies by language)
+- Output estimate: 30% of input, min 500 tokens
+- Single-turn only (doesn't account for tool iterations)
+
+Good enough for dogfooding refactors. Future: tiktoken for accuracy, multi-turn estimation.
 
 ## Project Overview
 Terminal-only CLI for Claude AI with tool support. Built for Unix workflows (tmux, vim, shell). No GUI, no IDE.
@@ -10,8 +46,13 @@ Terminal-only CLI for Claude AI with tool support. Built for Unix workflows (tmu
 ### File Structure
 ```
 cmd/claude/
-  ├── claude.go      # Main CLI, API calls, tool execution
-  └── storage.go     # Request/response file pair management
+  ├── claude.go           # 1353 lines: Main CLI, API calls, tool execution
+  ├── storage.go          # 277 lines: Request/response pairs, audit log, replay
+  ├── display.go          # 378 lines: Terminal formatting, diffs, syntax highlighting
+  ├── cost_estimation.go  # 128 lines: Token counting, cost estimation
+  ├── api_test.go         # Mock API server, error handling tests
+  ├── claude_test.go      # Storage, options, helper function tests
+  └── cost_test.go        # Cost estimation tests
 ```
 
 ### Storage System (CRITICAL)
@@ -30,6 +71,39 @@ cmd/claude/
 - Replay without API calls (saves tokens/cost)
 - DB export ready (SQLite/Postgres)
 
+**Cost Estimation Storage:**
+- `--estimate` creates `request_TIMESTAMP.json` without paired response
+- `--execute` handles unpaired requests (checks for request_*.json when no complete pairs exist)
+- After execution, complete pair exists: `request_TIMESTAMP.json` + `response_TIMESTAMP.json`
+
+**Conversation reconstruction:** Scan .claude/, sort by timestamp, pair up request/response files
+
+### Display System (display.go)
+**Design:** Separation of concerns - formatting vs persistence
+- **TTY Detection:** `isTTY()` checks if output is terminal
+  - Terminal: ANSI colors, syntax highlighting
+  - Pipe/file: Plain text only (NO escape codes)
+- **Syntax Highlighting:** chroma library for code blocks
+  - Automatic language detection
+  - Multiple themes (monokai default)
+- **Unified Diff:** Git-style diff with context
+  - Color-coded: red (deletions), green (additions), cyan (hunks)
+  - Handles new files, deletions, modifications
+- **Markdown Formatting:** Colored headers, bullets, quotes
+- **Helper Functions:** `ToolHeader()`, `ToolResult()`, `Warning()`, `Info()`
+
+**Critical principle:** Display functions NEVER write files. Only format for human viewing.
+
+### Audit System
+**Design:** Complete tool execution trail in .claude/tool_log.jsonl
+- **Format:** JSONL (newline-delimited JSON)
+  - Append-only (crash-safe)
+  - One tool execution = one line
+  - Easy to grep/parse
+- **Fields:** timestamp, tool, input, result, success, duration_ms, conversation_id, dry_run, error
+- **Usage:** Every tool execution logged (read_file, write_file, bash_command)
+- **Access:** Direct file inspection or future --tool-log viewer
+
 **Conversation reconstruction:** Scan .claude/, sort by timestamp, pair up request/response files
 
 ### Key Features
@@ -37,6 +111,10 @@ cmd/claude/
   - `""` = dry-run (default) - shows what WOULD happen
   - `write` = execute file writes
   - `all` = execute everything
+- `--estimate` / `--execute` cost estimation workflow
+  - `--estimate` = show cost, save message, don't execute
+  - `--execute` = run last user message from conversation
+  - `--max-cost-override N` = override max-cost for this run
 - `--replay` = re-execute tools from saved response WITHOUT calling API
   - `--replay=""` = replay latest
   - `--replay=20060102_150405` = replay specific timestamp
@@ -66,6 +144,22 @@ go run ./cmd/claude --replay="" --tool=write
 go run ./cmd/claude --stats
 ```
 
+**Safe Refactoring Pattern:**
+```bash
+# 1. Estimate cost
+echo "refactor task" | go run ./cmd/claude --tool=all --estimate
+
+# 2. Review estimate (shows: ~$0.03)
+
+# 3. Execute if acceptable
+go run ./cmd/claude --execute --max-cost-override=0.05
+
+# 4. Verify and commit
+git diff
+go test ./...
+git commit -m "refactor: ..."
+```
+
 ## Current State
 
 **When providing patches:**
@@ -75,21 +169,40 @@ go run ./cmd/claude --stats
 4. User applies with: `git apply <patchfile>` or `patch -p1 < <patchfile>`
 
 ### What Works
-- Basic tool execution (read_file, write_file)
+- Tool execution: read_file, write_file, bash_command
+- bash_command with comprehensive safety:
+  - Whitelist: ls, cat, grep, find, head, tail, wc, echo, pwd, date, git, go
+  - Blocklist: sudo, rm, mv, cp, chmod, chown, curl, wget, ||, &&
+  - Git limited to: log, diff, show, status, blame
+  - 30-second timeout with partial output on timeout
+  - Path traversal protection
+- Complete audit logging system (tool_log.jsonl)
+  - Captures: timestamp, tool, input, result, success, duration, dry_run flag
+  - JSONL format (append-only, crash-safe)
 - Request/response saving as file pairs
 - Response saved as array (captures all iterations)
-- Replay from saved responses
-- Dry-run mode
-- Cost tracking
-- Token estimation
-- Conversation truncation
+- Replay from saved responses (re-executes tools without API calls)
+- Dry-run mode (default, shows diffs/commands without executing)
+- Terminal display system (display.go):
+  - Syntax highlighting via chroma library
+  - Proper unified diff with git-style colors
+  - TTY detection (never writes ANSI codes to files)
+  - Markdown formatting with colored headers, bullets, quotes
+- Cost tracking with --max-cost enforcement
+- Token estimation (4 chars = 1 token approximation)
+- Conversation truncation (--truncate flag)
+- Multiple verbosity levels: silent, normal, verbose, debug
+- JSON output mode (--output=json) for scripting
 
 ### What Doesn't Work / Missing
-- **NO TESTS** (critical gap)
-- bash_command tool (only have read/write)
-- Proper unified diff display (currently just dumps new content)
-- Syntax highlighting for terminal output
+- **Incomplete test coverage** (critical gap)
+  - bash_command validation edge cases
+  - Display formatting tests
+  - Tool execution integration tests
+  - Safety boundary conditions
 - Atomic file writes (crash-safe)
+  - Currently uses os.WriteFile directly
+  - Need temp file + rename pattern
 
 ## Design Decisions Made
 
@@ -115,48 +228,45 @@ go run ./cmd/claude --stats
 ## TODOs (Priority Order)
 
 ### High Priority
-1. **Add comprehensive tests** (`cmd/claude/claude_test.go`)
-   - Test storage functions (saveRequest, saveResponse, loadConversationHistory)
-   - Test replay logic
-   - Test tool execution
-   - Test permission system
-   - Mock HTTP server for API simulation (heavily documented)
+1. **Expand test coverage** (`cmd/claude/*_test.go`)
+   - bash_command validation edge cases (whitelist bypass attempts)
+   - Display formatting (diff generation, TTY detection)
+   - Tool execution integration (multi-iteration loops)
+   - Safety boundary conditions (path traversal, command injection)
+   - Current: Basic storage/options tests exist, need comprehensive coverage
 
-2. **Add bash_command tool**
-   - Safety checks (whitelist/blacklist?)
-   - Respect `--tool=command` or `--tool=all`
-
-3. **Implement proper unified diff**
-   - Use diff library or implement basic diff3
-   - Show context lines, +/- markers
-   - Current: just dumps new content
-
-### Medium Priority
-4. **Atomic file writes** (crash-safe)
+2. **Atomic file writes** (crash-safe)
    - Write to temp file, rename on success
    - Prevents corruption on crash
+   - Pattern: `ioutil.TempFile()` + `os.Rename()`
 
-5. **Syntax highlighting for terminal output**
-   - Detect TTY
-   - Use ANSI escape codes for markdown/code blocks
-   - Never write escape codes to files
+### Medium Priority
+3. **Git integration for tool safety**
+   - Auto-commit before each tool execution (as specified in tool-safety-spec.md)
+   - Enable --rollback to undo tool changes
+   - Configurable via --no-git flag
 
-6. **DB export capability**
+4. **DB export capability**
    - SQLite/Postgres from request/response pairs
    - Useful for analytics, searching old conversations
 
+5. **Enhanced bash_command safety (Phase 2)**
+   - Firejail integration for process isolation
+   - Domain whitelist for curl/wget
+   - Per-tool permissions granularity
+
 ### Low Priority / Future
-7. **Dynamic model list**
+6. **Dynamic model list**
    - Query https://docs.anthropic.com/en/docs/about-claude/models
    - Currently hardcoded
 
-8. **Streaming responses** (SSE from API)
+7. **Streaming responses** (SSE from API)
 
-9. **Project-level context** (scan all .go files)
+8. **Project-level context** (scan all .go files)
 
-10. **Git integration** (auto-commit on changes?)
+9. **Templates for common tasks**
 
-11. **Templates for common tasks**
+10. **Tool log viewer** (--tool-log flag to display recent executions)
 
 ## Open Questions
 
